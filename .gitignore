@@ -8,13 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
-detrtest.py
-realtimeimage.py
-data/archive
 
-# data
-checkpoints
-# macOS system files
+# Models, checkpoints & datasets
+checkpoints/
+pretrained/
+data/landmarks/
+data/user/
+data/autsl/
+*.pt
+*.task
+logs/
+
+# System & Notebook files
 .DS_Store
 .DS_Store?
 ._*
@@ -24,5 +29,5 @@ ehthumbs.db
 Thumbs.db
 LossAnalysis.ipynb
 .ipynb_checkpoints
-archive
-example_loggers
+detrtest.py
+realtimeimage.py

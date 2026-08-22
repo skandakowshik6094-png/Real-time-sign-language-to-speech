@@ -1,5 +1,10 @@
-import logging
 import sys
+import logging
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union, Dict, Any
@@ -82,7 +87,7 @@ class SignLanguageLogger:
         log_file = (
             self.logs_dir / f"{self.name}_{datetime.now().strftime('%Y%m%d')}.log"
         )
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(self.level)
 
         # Create formatter

@@ -42,7 +42,7 @@ class DETR(nn.Module):
     def __init__(self, num_classes, hidden_dim=256, nheads=8,
                  num_encoder_layers=1, num_decoder_layers=1, num_queries=25):
         super().__init__()
-        
+        self.num_classes = num_classes
         # Initialize logger and model handler
         self.logger = get_logger("model")
         self.model_handler = ModelHandler()
@@ -120,16 +120,39 @@ class DETR(nn.Module):
             'pred_boxes': self.linear_bbox(hs).sigmoid()
         }
     
-    def log_model_info(self):
-        """Log model parameter information."""
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        self.model_handler.log_parameters_count(total_params, trainable_params)
-        
+    def update_num_classes(self, new_num_classes: int):
+        """Dynamically update linear_class head for new classes while preserving existing weights."""
+        if new_num_classes == self.num_classes:
+            return
+
+        old_num_classes = self.num_classes
+        hidden_dim = self.linear_class.in_features
+
+        new_linear_class = nn.Linear(hidden_dim, new_num_classes + 1)
+        with torch.no_grad():
+            # Copy existing class weights
+            min_cls = min(old_num_classes, new_num_classes)
+            new_linear_class.weight[:min_cls] = self.linear_class.weight[:min_cls]
+            new_linear_class.bias[:min_cls] = self.linear_class.bias[:min_cls]
+            
+            # Copy background class weight (last index)
+            new_linear_class.weight[-1] = self.linear_class.weight[-1]
+            new_linear_class.bias[-1] = self.linear_class.bias[-1]
+
+        self.linear_class = new_linear_class
+        self.num_classes = new_num_classes
+        self.logger.info(f"Updated model class count from {old_num_classes} to {new_num_classes}")
+
     def load_pretrained(self, checkpoint_path: str):
-        """Load pretrained weights with logging."""
+        """Load pretrained weights with logging and automatic class count adaptation."""
         try:
-            self.load_state_dict(torch.load(checkpoint_path))
+            state_dict = torch.load(checkpoint_path, map_location='cpu')
+            if 'linear_class.weight' in state_dict:
+                checkpoint_num_classes = state_dict['linear_class.weight'].shape[0] - 1
+                if checkpoint_num_classes != self.num_classes:
+                    self.update_num_classes(checkpoint_num_classes)
+
+            self.load_state_dict(state_dict, strict=False)
             self.model_handler.log_model_loading(checkpoint_path, success=True)
         except Exception as e:
             self.logger.error(f"Failed to load checkpoint: {str(e)}")

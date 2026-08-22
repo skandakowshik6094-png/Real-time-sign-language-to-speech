@@ -1,10 +1,9 @@
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, Dataset 
+from torch.utils.data import DataLoader, Dataset, ConcatDataset, Sampler
 import os 
 from PIL import Image 
 import albumentations as A
-import numpy as np
 from colorama import Fore 
 from matplotlib import pyplot as plt 
 from utils.boxes import rescale_bboxes, stacker
@@ -20,8 +19,14 @@ class DETRData(Dataset):
         self.path = path
         self.labels_path = os.path.join(self.path, 'labels')
         self.images_path = os.path.join(self.path, 'images')
-        self.label_files = os.listdir(self.labels_path) 
-        self.labels = list(filter(lambda x: x.endswith('.txt'), self.label_files))
+        
+        if os.path.exists(self.labels_path):
+            self.label_files = os.listdir(self.labels_path) 
+            self.labels = list(filter(lambda x: x.endswith('.txt'), self.label_files))
+        else:
+            self.label_files = []
+            self.labels = []
+            
         self.train = train
         
         # Initialize logger
@@ -54,7 +59,7 @@ class DETRData(Dataset):
         self.transform = A.Compose(
             [   
                 A.Resize(500,500),
-                *([A.RandomCrop(width=224, height=224, p=0.33)] if self.train else []), # Example random crop
+                *([A.RandomCrop(width=224, height=224, p=0.33)] if self.train else []),
                 A.Resize(224,224),
                 *([A.HorizontalFlip(p=0.5)] if self.train else []),
                 *([A.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5, p=0.5)] if self.train else []),
@@ -63,16 +68,49 @@ class DETRData(Dataset):
             ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'])
         )
         
+        image_only_transform = A.Compose([
+            A.Resize(224, 224),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            A.ToTensorV2()
+        ])
+        
+        fallback_transform = A.Compose(
+            [
+                A.Resize(224, 224),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                A.ToTensorV2()
+            ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'])
+        )
+        
+        # Sanitize bboxes to ensure valid yolo format (0, 1)
+        sanitized_bboxes = []
+        for box in bboxes:
+            cx, cy, w, h = box[0], box[1], box[2], box[3]
+            cx = max(0.01, min(0.99, float(cx)))
+            cy = max(0.01, min(0.99, float(cy)))
+            w = max(0.01, min(0.98, float(w)))
+            h = max(0.01, min(0.98, float(h)))
+            sanitized_bboxes.append([cx, cy, w, h])
+        bboxes = np.array(sanitized_bboxes)
+
         for attempt in range(max_attempts):
             try:
                 transformed = self.transform(image=image, bboxes=bboxes, class_labels=labels)
-                # Check if we still have bboxes after transformation
                 if len(transformed['bboxes']) > 0:
                     return transformed
-            except:
+            except Exception:
                 continue
         
-        return {'image': image, 'bboxes': bboxes, 'class_labels': labels}
+        try:
+            transformed = fallback_transform(image=image, bboxes=bboxes, class_labels=labels)
+            if len(transformed['bboxes']) > 0:
+                return transformed
+        except Exception:
+            pass
+
+        img_res = image_only_transform(image=image)
+        fallback_boxes = np.array([[0.5, 0.5, 0.5, 0.5]])
+        return {'image': img_res['image'], 'bboxes': fallback_boxes, 'class_labels': labels}
 
     def __len__(self): 
         return len(self.labels) 
@@ -88,20 +126,81 @@ class DETRData(Dataset):
         class_labels = []
         bounding_boxes = []
         for annotation in annotations: 
-            annotation = annotation.split('\n')[:-1][0].split(' ')
-            class_labels.append(annotation[0]) 
-            bounding_boxes.append(annotation[1:])
+            annotation = annotation.strip().split(' ')
+            if len(annotation) >= 5 and int(annotation[0]) >= 0:
+                class_labels.append(annotation[0]) 
+                bounding_boxes.append(annotation[1:5])
+        
+        if len(class_labels) == 0:
+            # Fallback for unmapped or empty labels
+            class_labels = [0]
+            bounding_boxes = [[0.5, 0.5, 0.5, 0.5]]
+            
         class_labels = np.array(class_labels).astype(int) 
         bounding_boxes = np.array(bounding_boxes).astype(float) 
 
         augmented = self.safe_transform(image=np.array(img), bboxes=bounding_boxes, labels=class_labels)
         augmented_img_tensor = augmented['image']
+        
+        if not isinstance(augmented_img_tensor, torch.Tensor):
+            augmented_img_tensor = torch.as_tensor(augmented_img_tensor, dtype=torch.float32)
+            if augmented_img_tensor.ndim == 3 and augmented_img_tensor.shape[-1] in (1, 3):
+                augmented_img_tensor = augmented_img_tensor.permute(2, 0, 1)
+
         augmented_bounding_boxes = np.array(augmented['bboxes'])
         augmented_classes = augmented['class_labels']
 
         labels = torch.tensor(augmented_classes, dtype=torch.long)  
         boxes = torch.tensor(augmented_bounding_boxes, dtype=torch.float32)
         return augmented_img_tensor, {'labels': labels, 'boxes': boxes}
+
+
+class AUTSLDETRData(DETRData):
+    """Dataset loader specifically for AUTSL dataset format."""
+    def __init__(self, path="data/autsl/train", train=True):
+        super().__init__(path=path, train=train)
+
+
+class CombinedDETRData(Dataset):
+    """
+    Combined dataset loader that merges existing dataset and AUTSL dataset.
+    Supports balanced sampling.
+    """
+    def __init__(self, existing_path="data/train", autsl_path="data/autsl/train", train=True):
+        super().__init__()
+        self.existing_ds = DETRData(existing_path, train=train)
+        self.autsl_ds = AUTSLDETRData(autsl_path, train=train)
+        self.concat_ds = ConcatDataset([self.existing_ds, self.autsl_ds])
+
+    def __len__(self):
+        return len(self.concat_ds)
+
+    def __getitem__(self, idx):
+        return self.concat_ds[idx]
+
+
+class BalancedDatasetSampler(Sampler):
+    """
+    Balanced dataset sampler for combined dataset to avoid bias towards larger dataset.
+    """
+    def __init__(self, len_ds1, len_ds2, num_samples=None):
+        self.len_ds1 = len_ds1
+        self.len_ds2 = len_ds2
+        self.num_samples = num_samples if num_samples is not None else 2 * max(len_ds1, len_ds2)
+
+    def __iter__(self):
+        indices_ds1 = torch.randint(0, self.len_ds1, (self.num_samples // 2,), dtype=torch.int64).tolist()
+        indices_ds2 = (torch.randint(0, self.len_ds2, (self.num_samples // 2,), dtype=torch.int64) + self.len_ds1).tolist()
+        
+        combined = []
+        for i in range(self.num_samples // 2):
+            combined.append(indices_ds1[i])
+            combined.append(indices_ds2[i])
+        return iter(combined)
+
+    def __len__(self):
+        return self.num_samples
+
 
 if __name__ == '__main__':
     dataset = DETRData('data/train', train=True) 

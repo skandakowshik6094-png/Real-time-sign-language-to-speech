@@ -71,13 +71,14 @@ def stacker(batch):
     targets = []
     
     for image, target in batch:
+        if not isinstance(image, torch.Tensor):
+            image = torch.as_tensor(image, dtype=torch.float32)
+            if image.ndim == 3 and image.shape[-1] in (1, 3):
+                image = image.permute(2, 0, 1)
         images.append(image)
         targets.append(target)
     
     # Stack all images into a single tensor
-    # This works because all images have the same size after transforms
     images = torch.stack(images, dim=0)
     
-    # Keep targets as a list - each element corresponds to one image
-    # This allows each image to have a different number of objects
     return images, targets

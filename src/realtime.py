@@ -1,104 +1,96 @@
+import os
 import cv2
+import time
 import torch
-from torch import load
-from model import DETR
-import albumentations as A
-from utils.boxes import rescale_bboxes
 from utils.setup import get_classes, get_colors
 from utils.logger import get_logger
-from utils.rich_handlers import DetectionHandler, create_detection_live_display
-import sys
-import time 
+from hand_landmarks import HandLandmarkDetector
+from landmark_model import LandmarkClassifier
 
-
-# Initialize logger and handlers
 logger = get_logger("realtime")
-detection_handler = DetectionHandler()
 
-logger.print_banner()
-logger.realtime("Initializing real-time sign language detection...")
+CLASSES = get_classes()
+COLORS = get_colors()
+num_classes = len(CLASSES)
 
-transforms = A.Compose(
-        [   
-            A.Resize(224,224),
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            A.ToTensorV2()
-        ]
-    )
+model = LandmarkClassifier(num_classes=num_classes)
+CKPT_PATH = "checkpoints/landmark_model.pt"
 
-model = DETR(num_classes=3)
+if os.path.exists(CKPT_PATH):
+    try:
+        data = torch.load(CKPT_PATH, map_location="cpu")
+        if isinstance(data, dict) and "state_dict" in data:
+            ckpt_classes = data.get("classes", CLASSES)
+            if len(ckpt_classes) != model.num_classes:
+                model.update_num_classes(len(ckpt_classes))
+                CLASSES = ckpt_classes
+            model.load_state_dict(data["state_dict"])
+        else:
+            model.load_state_dict(data)
+        logger.success(f"Loaded Landmark Neural Model from '{CKPT_PATH}'")
+    except Exception as e:
+        logger.warning(f"Could not load checkpoint '{CKPT_PATH}': {e}")
+
 model.eval()
-model.load_pretrained('pretrained/4426_model.pt')
-CLASSES = get_classes() 
-COLORS = get_colors() 
+hand_detector = HandLandmarkDetector(show_coordinates=True)
 
-logger.realtime("Starting camera capture...")
-cap = cv2.VideoCapture(0)
+def run_realtime_detection(camera_id=0):
+    logger.realtime("Starting high-precision MediaPipe Landmark Recognition...")
+    cap = cv2.VideoCapture(camera_id)
 
-# Initialize performance tracking
-frame_count = 0
-fps_start_time = time.time()
+    if not cap.isOpened():
+        logger.error(f"Could not open camera {camera_id}")
+        return
 
-while cap.isOpened(): 
-    ret, frame = cap.read()
-    if not ret:
-        logger.error("Failed to read frame from camera")
-        break
-        
-    # Time the inference
-    inference_start = time.time()
-    transformed = transforms(image=frame)
-    result = model(torch.unsqueeze(transformed['image'], dim=0))
-    inference_time = (time.time() - inference_start) * 1000  # Convert to ms
+    frame_count = 0
+    fps_start_time = time.time()
 
-    probabilities = result['pred_logits'].softmax(-1)[:,:,:-1] 
-    max_probs, max_classes = probabilities.max(-1)
-    keep_mask = max_probs > 0.8
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            logger.error("Failed to read frame from camera")
+            break
 
-    batch_indices, query_indices = torch.where(keep_mask) 
+        frame, hand_pts_list, feature_vectors = hand_detector.process_and_draw(frame)
 
-    bboxes = rescale_bboxes(result['pred_boxes'][batch_indices, query_indices,:], (1920,1080))
-    classes = max_classes[batch_indices, query_indices]
-    probas = max_probs[batch_indices, query_indices]
+        for hand_idx, (pts, feats) in enumerate(zip(hand_pts_list, feature_vectors)):
+            if len(feats) == 63:
+                x_tensor = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
+                class_idx, confidence, probs = model.predict_probs(x_tensor)
 
-    # Prepare detection results for logging
-    detections = []
-    for bclass, bprob, bbox in zip(classes, probas, bboxes): 
-        bclass_idx = bclass.detach().numpy()
-        bprob_val = bprob.detach().numpy() 
-        x1,y1,x2,y2 = bbox.detach().numpy()
-        
-        detections.append({
-            'class': CLASSES[bclass_idx],
-            'confidence': float(bprob_val),
-            'bbox': [float(x1), float(y1), float(x2), float(y2)]
-        })
-        
-        # Draw bounding boxes on frame
-        frame = cv2.rectangle(frame, (int(x1),int(y1)), (int(x2),int(y2)), COLORS[bclass_idx], 10)
-        frame_text = f"{CLASSES[bclass_idx]} - {round(float(bprob_val),4)}"
-        frame = cv2.rectangle(frame, (int(x1),int(y1)-100), (int(x1)+700,int(y1)), COLORS[bclass_idx], -1)
-        frame = cv2.putText(frame, frame_text, (int(x1),int(y1)), cv2.FONT_HERSHEY_DUPLEX, 2, (255,255,255), 4, cv2.LINE_AA)
+                if confidence > 0.40 and class_idx < len(CLASSES):
+                    cls_name = CLASSES[class_idx]
+                    color = COLORS[class_idx] if class_idx < len(COLORS) else (0, 255, 0)
+                else:
+                    cls_name = "Detecting Sign..."
+                    color = (200, 200, 200)
 
-    # Calculate FPS
-    frame_count += 1
-    if frame_count % 30 == 0:  # Log every 30 frames
-        elapsed_time = time.time() - fps_start_time
-        fps = 30 / elapsed_time
-        
-        # Log detection results and performance
-        if detections:
-            detection_handler.log_detections(detections, frame_id=frame_count)
-        detection_handler.log_inference_time(inference_time, fps)
-        
-        # Reset FPS counter
-        fps_start_time = time.time()
+                # Wrist location for placing text overlay
+                wx, wy = pts[0][:2]
+                label_text = f"{cls_name} ({round(confidence * 100, 1)}%)"
 
-    cv2.imshow('Frame', frame)
+                # Draw label background card
+                cv2.rectangle(frame, (max(10, wx - 100), max(10, wy - 60)),
+                              (min(frame.shape[1]-10, wx + len(label_text)*16), max(40, wy - 10)),
+                              color, -1)
+                cv2.putText(frame, label_text, (max(15, wx - 95), max(32, wy - 20)),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'): 
-        logger.realtime("Stopping real-time detection...")
-        break
+        frame_count += 1
+        if frame_count % 30 == 0:
+            elapsed_time = time.time() - fps_start_time
+            fps = 30 / max(1e-5, elapsed_time)
+            fps_start_time = time.time()
 
-cap.release() 
-cv2.destroyAllWindows() 
+        cv2.imshow("MediaPipe 3D Landmark Sign Recognition", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            logger.realtime("Stopping real-time recognition...")
+            break
+
+    cap.release()
+    hand_detector.close()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    run_realtime_detection()
