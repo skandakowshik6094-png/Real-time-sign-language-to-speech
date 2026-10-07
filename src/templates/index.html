@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SignSense — Real-time Sign Language Recognition</title>
+<meta name="description" content="Real-time ASL recognition powered by MediaPipe and deep learning.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#060812;--surface:#0c1020;--card:rgba(255,255,255,.04);--card-h:rgba(255,255,255,.07);
+  --border:rgba(255,255,255,.07);--border-b:rgba(255,255,255,.14);
+  --text:#f1f5f9;--text2:#94a3b8;--text3:#475569;
+  --accent:#7c6af7;--acc2:#22d3ee;--glow:rgba(124,106,247,.35);
+  --ok:#4ade80;--err:#f87171;--warn:#fb923c;
+  --sw:400px;--hh:60px;--r:14px;--rs:9px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;overflow:hidden;-webkit-font-smoothing:antialiased}
+.app{display:grid;grid-template-rows:var(--hh) 1fr;grid-template-columns:1fr var(--sw);grid-template-areas:"hd hd""main sb";height:100vh}
+
+/* ─── Header ─────────────────────────────────────────────────────── */
+header{grid-area:hd;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:rgba(6,8,18,.92);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);z-index:100}
+.logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.1rem;background:linear-gradient(135deg,var(--accent),var(--acc2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:-.4px}
+.logo-box{width:32px;height:32px;background:linear-gradient(135deg,var(--accent),var(--acc2));border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.st-pill{display:flex;align-items:center;gap:7px;padding:5px 14px 5px 10px;border-radius:100px;background:var(--card);border:1px solid var(--border);font-size:.76rem;font-weight:600;color:var(--text2);transition:all .3s}
+.st-pill.live{border-color:rgba(74,222,128,.3);background:rgba(74,222,128,.07);color:var(--ok)}
+.st-dot{width:7px;height:7px;border-radius:50%;background:var(--text3);transition:all .3s}
+.st-pill.live .st-dot{background:var(--ok);box-shadow:0 0 6px var(--ok);animation:blink 2s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ─── Camera area ────────────────────────────────────────────────── */
+.main-area{grid-area:main;display:flex;align-items:center;justify-content:center;padding:18px;background:radial-gradient(ellipse at 40% 50%,rgba(124,106,247,.06) 0%,transparent 65%),var(--bg);overflow:hidden}
+.cam-wrap{position:relative;border-radius:var(--r);overflow:hidden;background:var(--surface);box-shadow:0 0 0 1px var(--border),0 24px 60px rgba(0,0,0,.55);transition:box-shadow .4s;width:100%;max-width:900px;aspect-ratio:16/10;max-height:calc(100vh - var(--hh) - 36px)}
+.cam-wrap.live{box-shadow:0 0 0 1px rgba(124,106,247,.45),0 0 50px rgba(124,106,247,.18),0 24px 60px rgba(0,0,0,.55)}
+#cam-feed{width:100%;height:100%;object-fit:cover;display:none}
+.cam-idle{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--text3)}
+.cam-idle-icon{width:72px;height:72px;border-radius:50%;background:rgba(255,255,255,.03);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center}
+.cam-idle p{font-size:.88rem;font-weight:500}
+.cam-idle span{font-size:.76rem}
+.cam-badge{position:absolute;top:14px;left:14px;display:none;align-items:center;gap:8px;background:rgba(0,0,0,.7);backdrop-filter:blur(12px);border:1px solid var(--border-b);border-radius:8px;padding:5px 14px;font-size:.78rem;font-weight:700;color:var(--text)}
+.cam-badge.show{display:flex}
+.cam-badge-dot{width:6px;height:6px;border-radius:50%;background:var(--ok);animation:blink 1.5s ease-in-out infinite}
+
+/* ─── Sidebar ────────────────────────────────────────────────────── */
+.sb{grid-area:sb;background:var(--surface);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sb-scroll{flex:1;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.08) transparent}
+.sb-scroll::-webkit-scrollbar{width:3px}
+.sb-scroll::-webkit-scrollbar-track{background:transparent}
+.sb-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
+
+/* ─── Detection panel ────────────────────────────────────────────── */
+.det-panel{padding:20px 20px 16px;border-bottom:1px solid var(--border);background:linear-gradient(180deg,rgba(124,106,247,.09) 0%,transparent 100%);text-align:center}
+.det-lbl{font-size:.66rem;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:var(--text3);margin-bottom:2px}
+.letter-ring{position:relative;margin:6px auto;width:140px;height:140px;display:flex;align-items:center;justify-content:center}
+.letter-ring::before,.letter-ring::after{content:'';position:absolute;inset:0;border-radius:50%;border:1px solid rgba(124,106,247,.1);transition:all .3s}
+.letter-ring.on::before{border-color:rgba(124,106,247,.4);animation:rp 1.6s ease-out infinite}
+.letter-ring.on::after{border-color:rgba(34,211,238,.2);animation:rp 1.6s ease-out .5s infinite}
+@keyframes rp{0%{transform:scale(.85);opacity:1}100%{transform:scale(1.25);opacity:0}}
+#ltr{font-size:5rem;font-weight:900;line-height:1;color:var(--text3);transition:all .2s cubic-bezier(.34,1.56,.64,1);user-select:none}
+#ltr.on{background:linear-gradient(135deg,#fff 0%,var(--acc2) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 18px rgba(34,211,238,.28))}
+#ltr.pop{animation:pop .38s cubic-bezier(.34,1.56,.64,1)}
+@keyframes pop{0%{transform:scale(.6)}60%{transform:scale(1.18)}100%{transform:scale(1)}}
+.conf-area{margin-top:10px}
+.conf-meta{display:flex;justify-content:space-between;font-size:.7rem;color:var(--text3);margin-bottom:5px}
+#conf-pct{font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--acc2);font-size:.78rem}
+.conf-bar{height:5px;background:rgba(255,255,255,.06);border-radius:100px;overflow:hidden}
+#conf-fill{height:100%;border-radius:100px;background:linear-gradient(90deg,var(--accent),var(--acc2));box-shadow:0 0 10px var(--glow);transition:width .22s ease;width:0}
+
+/* ─── Buffer panel ───────────────────────────────────────────────── */
+.buf-panel{padding:13px 16px;border-bottom:1px solid var(--border)}
+.p-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}
+.p-ttl{font-size:.66rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text3)}
+.btn-grp{display:flex;gap:3px}
+.bx{padding:4px 8px;border-radius:6px;background:var(--card);border:1px solid var(--border);color:var(--text2);font-family:'Inter',sans-serif;font-size:.67rem;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
+.bx:hover{background:var(--card-h);color:var(--text)}
+.bx.red:hover{border-color:rgba(248,113,113,.4);color:var(--err)}
+#buf-txt{font-family:'JetBrains Mono',monospace;font-size:.88rem;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--rs);padding:9px 12px;min-height:50px;word-break:break-all;line-height:1.75;position:relative}
+.cur{display:inline-block;width:2px;height:1em;background:var(--accent);vertical-align:text-bottom;animation:cb 1s step-end infinite;margin-left:1px}
+@keyframes cb{0%,100%{opacity:1}50%{opacity:0}}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px;min-height:20px}
+.chip{padding:3px 9px;border-radius:100px;background:rgba(124,106,247,.12);border:1px solid rgba(124,106,247,.24);font-size:.68rem;font-family:'JetBrains Mono',monospace;color:var(--acc2);animation:cin .2s ease}
+@keyframes cin{from{transform:scale(.75);opacity:0}to{transform:scale(1);opacity:1}}
+
+/* ─── Controls panel ─────────────────────────────────────────────── */
+.ctrl-panel{padding:13px 16px;display:flex;flex-direction:column;gap:9px}
+.btn-main{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:13px;border-radius:var(--rs);border:none;font-family:'Inter',sans-serif;font-size:.88rem;font-weight:700;cursor:pointer;transition:all .2s;letter-spacing:.3px}
+.btn-main.go{background:linear-gradient(135deg,var(--accent),#a78bfa);color:#fff;box-shadow:0 4px 20px rgba(124,106,247,.4)}
+.btn-main.go:hover{transform:translateY(-1px);box-shadow:0 6px 26px rgba(124,106,247,.55)}
+.btn-main.stop{background:linear-gradient(135deg,#ef4444,#f97316);color:#fff;box-shadow:0 4px 20px rgba(239,68,68,.35)}
+.btn-main.stop:hover{transform:translateY(-1px);box-shadow:0 6px 26px rgba(239,68,68,.5)}
+.btn-main:active{transform:translateY(0) scale(.98)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--rs);padding:11px 13px;display:flex;flex-direction:column;gap:9px}
+.crow{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.cinfo{flex:1;min-width:0}
+.cname{font-size:.8rem;font-weight:600;color:var(--text)}
+.cdesc{font-size:.68rem;color:var(--text3);margin-top:2px}
+/* Toggle */
+.tog{position:relative;width:42px;height:23px;flex-shrink:0}
+.tog input{display:none}
+.tog-bg{position:absolute;inset:0;border-radius:100px;background:rgba(255,255,255,.09);cursor:pointer;transition:background .25s;border:1px solid var(--border)}
+.tog input:checked+.tog-bg{background:var(--accent);border-color:transparent}
+.tog-k{position:absolute;top:3px;left:3px;width:17px;height:17px;background:#fff;border-radius:50%;transition:transform .25s cubic-bezier(.34,1.56,.64,1);pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.3)}
+.tog input:checked~.tog-k{transform:translateX(19px)}
+/* Slider */
+.srow{display:flex;flex-direction:column;gap:4px}
+.shdr{display:flex;justify-content:space-between;font-size:.68rem;color:var(--text3)}
+.shdr span:last-child{font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--acc2)}
+input[type=range]{-webkit-appearance:none;width:100%;height:4px;background:rgba(255,255,255,.08);border-radius:100px;outline:none;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--acc2));cursor:pointer;box-shadow:0 0 8px var(--glow);transition:transform .15s}
+input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.25)}
+input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--acc2));border:none;cursor:pointer}
+select{width:100%;padding:7px 30px 7px 10px;background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Inter',sans-serif;font-size:.78rem;outline:none;cursor:pointer;margin-top:5px;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center}
+select option{background:#0c1020}
+select:focus{border-color:rgba(124,106,247,.5)}
+.sb-foot{height:8px}
+
+/* ─── Symbol Manager ─────────────────────────────────────────────── */
+.sym-panel{padding:14px 16px 4px;border-top:1px solid var(--border)}
+.sym-panel-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.sym-ref{background:none;border:none;color:var(--text3);cursor:pointer;font-size:.78rem;padding:2px 6px;border-radius:5px;transition:color .15s}
+.sym-ref:hover{color:var(--acc2)}
+.sym-grid{display:flex;flex-wrap:wrap;gap:4px;min-height:20px;margin-bottom:10px}
+.sym-chip{display:inline-flex;align-items:center;gap:3px;padding:3px 5px 3px 9px;border-radius:100px;background:rgba(124,106,247,.1);border:1px solid rgba(124,106,247,.22);font-size:.7rem;font-family:'JetBrains Mono',monospace;white-space:nowrap}
+.sym-chip .s-name{color:var(--text);font-weight:600}
+.sym-chip .s-cnt{color:var(--text3);font-size:.62rem;margin-left:2px}
+.sym-chip .s-del{background:none;border:none;color:var(--text3);cursor:pointer;padding:0 3px;font-size:.68rem;line-height:1;transition:color .15s}
+.sym-chip .s-del:hover{color:var(--err)}
+.sym-empty{color:var(--text3);font-size:.72rem;font-style:italic}
+.sym-add-lbl{font-size:.62rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text3);margin-bottom:5px}
+.sym-form{display:flex;flex-direction:column;gap:6px}
+.sym-inp{width:100%;padding:7px 10px;background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Inter',sans-serif;font-size:.8rem;outline:none;transition:border-color .2s}
+.sym-inp:focus{border-color:rgba(124,106,247,.5)}
+.sym-opts{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.sym-n-lbl{display:flex;align-items:center;gap:5px;font-size:.72rem;color:var(--text2)}
+.sym-n-inp{width:52px;padding:3px 6px;background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.78rem;outline:none;text-align:center}
+.sym-chk{display:flex;align-items:center;gap:5px;font-size:.72rem;color:var(--text2);cursor:pointer;user-select:none}
+.btn-collect{width:100%;padding:9px;border:none;border-radius:var(--rs);background:linear-gradient(135deg,#22d3ee,#7c6af7);color:#fff;font-family:'Inter',sans-serif;font-size:.82rem;font-weight:700;cursor:pointer;transition:all .2s;letter-spacing:.3px}
+.btn-collect:hover:not(:disabled){opacity:.88;transform:translateY(-1px)}
+.btn-collect:disabled{opacity:.38;cursor:not-allowed}
+.coll-prog{margin-top:2px}
+.coll-bar{height:5px;background:rgba(255,255,255,.07);border-radius:100px;overflow:hidden}
+.coll-fill{height:100%;background:linear-gradient(90deg,#22d3ee,#7c6af7);border-radius:100px;transition:width .15s;width:0}
+.coll-lbl{font-size:.67rem;color:var(--text3);text-align:center;margin-top:3px;font-family:'JetBrains Mono',monospace}
+.train-wrap{margin-top:8px;margin-bottom:6px}
+.btn-train{width:100%;padding:10px;border:1px solid rgba(74,222,128,.3);border-radius:var(--rs);background:rgba(74,222,128,.07);color:var(--ok);font-family:'Inter',sans-serif;font-size:.84rem;font-weight:700;cursor:pointer;transition:all .2s;letter-spacing:.3px}
+.btn-train:hover:not(:disabled){background:rgba(74,222,128,.15);transform:translateY(-1px)}
+.btn-train:disabled{opacity:.38;cursor:not-allowed}
+.train-prog-bar{height:5px;background:rgba(255,255,255,.07);border-radius:100px;overflow:hidden;margin:6px 0 3px}
+.train-prog-fill{height:100%;background:linear-gradient(90deg,var(--ok),var(--acc2));border-radius:100px;transition:width .3s;width:0}
+.train-logs{font-family:'JetBrains Mono',monospace;font-size:.64rem;color:var(--text2);max-height:72px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.08) transparent}
+.train-log{padding:1px 0}
+.train-log.err{color:var(--err)}
+.train-log.ok{color:var(--ok)}
+.btn-clear{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;margin-top:8px;padding:9px;border-radius:var(--rs);background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.25);color:var(--err);font-family:'Inter',sans-serif;font-size:.78rem;font-weight:700;cursor:pointer;transition:all .2s;letter-spacing:.3px}
+.btn-clear:hover{background:rgba(248,113,113,.2);border-color:rgba(248,113,113,.5);transform:translateY(-1px)}
+.btn-clear:active{transform:scale(.98)}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- ─── Header ─── -->
+<header>
+  <div class="logo">
+    <div class="logo-box">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="white">
+        <path d="M11 6a1 1 0 0 1 2 0v6h1V4a1 1 0 0 1 2 0v8h1V6a1 1 0 0 1 2 0v10a7 7 0 0 1-7 7h-2a7 7 0 0 1-7-7v-6a1 1 0 0 1 2 0v4h1V6a1 1 0 0 1 2 0v6h1V6z"/>
+      </svg>
+    </div>
+    SignSense
+  </div>
+  <div class="st-pill" id="st-pill">
+    <div class="st-dot"></div>
+    <span id="st-lbl">Idle</span>
+  </div>
+</header>
+
+<!-- ─── Camera ─── -->
+<main class="main-area">
+  <div class="cam-wrap" id="cam-wrap">
+    <div class="cam-idle" id="cam-idle">
+      <div class="cam-idle-icon">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#475569" stroke-width="1.5">
+          <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>
+        </svg>
+      </div>
+      <p>Camera is off</p>
+      <span>Press <strong style="color:#7c6af7">Start Detection</strong> to begin</span>
+    </div>
+    <img id="cam-feed" src="" alt="Live sign language camera feed">
+    <div class="cam-badge" id="cam-badge">
+      <div class="cam-badge-dot"></div>
+      <span id="badge-ltr">—</span>
+    </div>
+  </div>
+</main>
+
+<!-- ─── Sidebar ─── -->
+<aside class="sb">
+<div class="sb-scroll">
+
+  <!-- Detection -->
+  <div class="det-panel">
+    <div class="det-lbl">Detected Sign</div>
+    <div class="letter-ring" id="ltr-ring">
+      <div id="ltr">?</div>
+    </div>
+    <div class="conf-area">
+      <div class="conf-meta">
+        <span>Confidence</span>
+        <span id="conf-pct">0.0%</span>
+      </div>
+      <div class="conf-bar"><div id="conf-fill"></div></div>
+    </div>
+  </div>
+
+  <!-- Buffer -->
+  <div class="buf-panel">
+    <div class="p-hdr">
+      <div class="p-ttl">Sentence Builder</div>
+      <div class="btn-grp">
+        <button class="bx" id="btn-spc" title="Add space">Space</button>
+        <button class="bx" id="btn-bk"  title="Backspace">⌫</button>
+        <button class="bx" id="btn-cp"  title="Copy">Copy</button>
+        <button class="bx red" id="btn-clr" title="Clear">✕</button>
+      </div>
+    </div>
+    <div id="buf-txt"><span class="cur"></span></div>
+    <button class="btn-clear" id="btn-clear-big" title="Clear all text">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+      Clear Text
+    </button>
+    <div class="chips" id="chips"></div>
+  </div>
+
+  <!-- Controls -->
+  <div class="ctrl-panel">
+
+    <!-- Start / Stop -->
+    <button class="btn-main go" id="btn-tog" onclick="toggleDetection()">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+      Start Detection
+    </button>
+
+    <!-- TTS -->
+    <div class="card">
+      <div class="crow">
+        <div class="cinfo">
+          <div class="cname">🔊 Text-to-Speech</div>
+          <div class="cdesc">Speak detected signs aloud</div>
+        </div>
+        <label class="tog">
+          <input type="checkbox" id="tts-tog" checked onchange="toggleTTS()">
+          <div class="tog-bg"></div><div class="tog-k"></div>
+        </label>
+      </div>
+      <div class="srow">
+        <div class="shdr"><span>Speech Rate</span><span id="rate-lbl">160 wpm</span></div>
+        <input type="range" id="rate-sl" min="80" max="250" value="160" step="5"
+               oninput="document.getElementById('rate-lbl').textContent=this.value+' wpm'" onchange="syncTTS()">
+      </div>
+      <div class="srow">
+        <div class="shdr"><span>Volume</span><span id="vol-lbl">100%</span></div>
+        <input type="range" id="vol-sl" min="0" max="100" value="100" step="5"
+               oninput="document.getElementById('vol-lbl').textContent=this.value+'%'" onchange="syncTTS()">
+      </div>
+    </div>
+
+    <!-- Threshold -->
+    <div class="card">
+      <div class="cname">🎯 Confidence Threshold</div>
+      <div class="cdesc">Minimum confidence to accept a sign</div>
+      <div class="srow" style="margin-top:4px">
+        <div class="shdr"><span>Threshold</span><span id="thr-lbl">40%</span></div>
+        <input type="range" id="thr-sl" min="10" max="90" value="40" step="5"
+               oninput="document.getElementById('thr-lbl').textContent=this.value+'%'" onchange="syncThreshold()">
+      </div>
+    </div>
+
+    <!-- Auto-add -->
+    <div class="card">
+      <div class="crow">
+        <div class="cinfo">
+          <div class="cname">✍️ Auto-add to Sentence</div>
+          <div class="cdesc">Append each new sign automatically</div>
+        </div>
+        <label class="tog">
+          <input type="checkbox" id="auto-tog" checked onchange="autoAdd=this.checked">
+          <div class="tog-bg"></div><div class="tog-k"></div>
+        </label>
+      </div>
+    </div>
+
+    <!-- Camera -->
+    <div class="card">
+      <div class="cname">📷 Camera Input</div>
+      <div class="cdesc">Select capture device</div>
+      <select id="cam-sel">
+        <option value="0">Camera 0 — Default</option>
+        <option value="1">Camera 1</option>
+        <option value="2">Camera 2</option>
+      </select>
+    </div>
+
+    <div class="sb-foot"></div>
+  </div>
+</div>
+</aside>
+
+</div><!-- /.app -->
+
+<!-- ─── Symbol Manager panel (appended inside .sb-scroll via JS) ─── -->
+<template id="sym-panel-tpl">
+<div class="sym-panel" id="sym-panel">
+
+  <!-- Symbol grid -->
+  <div class="sym-panel-hdr">
+    <div class="p-ttl">Symbol Manager</div>
+    <button class="sym-ref" onclick="loadSymbols()" title="Refresh">↺</button>
+  </div>
+  <div class="sym-grid" id="sym-grid"></div>
+
+  <!-- Add / Replace form -->
+  <div class="sym-add-lbl">Add / Replace Symbol</div>
+  <div class="sym-form">
+    <input id="sym-name" class="sym-inp" type="text" placeholder="Symbol name (e.g. peace, ok)">
+    <div class="sym-opts">
+      <label class="sym-n-lbl">
+        <span>Samples:</span>
+        <input id="sym-n" class="sym-n-inp" type="number" value="60" min="10" max="300">
+      </label>
+      <label class="sym-chk">
+        <input type="checkbox" id="sym-replace">
+        <span>Replace existing</span>
+      </label>
+    </div>
+    <button class="btn-collect" id="btn-collect" onclick="startCollecting()">
+      ▶ Start Collecting
+    </button>
+    <div class="coll-prog" id="coll-prog" style="display:none">
+      <div class="coll-bar"><div class="coll-fill" id="coll-fill"></div></div>
+      <div class="coll-lbl" id="coll-lbl">0 / 60</div>
+    </div>
+  </div>
+
+  <!-- Train -->
+  <div class="train-wrap">
+    <button class="btn-train" id="btn-train" onclick="startTraining()">🧠 Train Model</button>
+    <div id="train-prog-wrap" style="display:none">
+      <div class="train-prog-bar"><div class="train-prog-fill" id="train-fill"></div></div>
+      <div class="train-logs" id="train-logs"></div>
+    </div>
+  </div>
+
+  <div class="sb-foot"></div>
+</div>
+</template>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────
+let running=false, autoAdd=true;
+let bufArr=[], lastLtr=null, lastAdded=null;
+let recent=[], evtSrc=null;
+
+// ── DOM ───────────────────────────────────────────────────────────────────
+const $ltr      = document.getElementById('ltr');
+const $ring     = document.getElementById('ltr-ring');
+const $cFill    = document.getElementById('conf-fill');
+const $cPct     = document.getElementById('conf-pct');
+const $buf      = document.getElementById('buf-txt');
+const $chips    = document.getElementById('chips');
+const $btnTog   = document.getElementById('btn-tog');
+const $stPill   = document.getElementById('st-pill');
+const $stLbl    = document.getElementById('st-lbl');
+const $camFeed  = document.getElementById('cam-feed');
+const $camIdle  = document.getElementById('cam-idle');
+const $camWrap  = document.getElementById('cam-wrap');
+const $camBadge = document.getElementById('cam-badge');
+const $badgeLtr = document.getElementById('badge-ltr');
+
+// ── Buffer ────────────────────────────────────────────────────────────────
+function renderBuf(){
+  $buf.innerHTML = bufArr.join('') + '<span class="cur"></span>';
+}
+function pushBuf(t){ bufArr.push(t); renderBuf(); }
+
+// ── Recent chips ──────────────────────────────────────────────────────────
+function addRecent(s){
+  recent = [s, ...recent.filter(x=>x!==s)].slice(0,10);
+  $chips.innerHTML = recent.map(x=>`<div class="chip">${x}</div>`).join('');
+}
+
+// ── Detection handler ─────────────────────────────────────────────────────
+function onDetect(d){
+  const {letter:l, confidence:c} = d;
+  if(!l){
+    $ltr.textContent='?'; $ltr.classList.remove('on','pop');
+    $ring.classList.remove('on');
+    $cFill.style.width='0%'; $cPct.textContent='0.0%';
+    $camBadge.classList.remove('show'); return;
+  }
+  $ring.classList.add('on');
+  $cFill.style.width=c+'%'; $cPct.textContent=c+'%';
+  if(l!==lastLtr){
+    $ltr.classList.remove('on','pop'); void $ltr.offsetWidth;
+    $ltr.textContent=l; $ltr.classList.add('on','pop');
+    $badgeLtr.textContent=l; $camBadge.classList.add('show');
+    if(autoAdd && l!==lastAdded){ pushBuf(l); lastAdded=l; }
+    addRecent(l); lastLtr=l;
+  }
+}
+
+// ── SSE ───────────────────────────────────────────────────────────────────
+function connectSSE(){
+  if(evtSrc){ evtSrc.close(); evtSrc=null; }
+  evtSrc = new EventSource('/events');
+  evtSrc.onmessage = e=>{
+    const d=JSON.parse(e.data);
+    if(d.type==='detection') onDetect(d);
+    if(d.type==='collect_done') onCollectDone(d);
+  };
+  evtSrc.onerror = ()=>{ if(running) setTimeout(connectSSE,1200); };
+}
+
+// ── Start / Stop ──────────────────────────────────────────────────────────
+async function toggleDetection(){
+  running ? await stopDetection() : await startDetection();
+}
+
+async function startDetection(){
+  const cam = parseInt(document.getElementById('cam-sel').value);
+  const r = await fetch('/control/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({camera_id:cam})});
+  if(!r.ok) return;
+  running=true;
+  $btnTog.innerHTML=`<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Stop Detection`;
+  $btnTog.className='btn-main stop';
+  $stPill.classList.add('live'); $stLbl.textContent='Live';
+  $camFeed.src='/video_feed?t='+Date.now();
+  $camFeed.style.display='block'; $camIdle.style.display='none';
+  $camWrap.classList.add('live');
+  connectSSE();
+}
+
+async function stopDetection(){
+  await fetch('/control/stop',{method:'POST'});
+  running=false;
+  $btnTog.innerHTML=`<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Start Detection`;
+  $btnTog.className='btn-main go';
+  $stPill.classList.remove('live'); $stLbl.textContent='Idle';
+  $camFeed.src=''; $camFeed.style.display='none';
+  $camIdle.style.display='flex'; $camWrap.classList.remove('live');
+  $ltr.textContent='?'; $ltr.classList.remove('on','pop');
+  $ring.classList.remove('on');
+  $cFill.style.width='0%'; $cPct.textContent='0.0%';
+  $camBadge.classList.remove('show'); lastLtr=null;
+  if(evtSrc){ evtSrc.close(); evtSrc=null; }
+}
+
+// ── TTS ───────────────────────────────────────────────────────────────────
+async function toggleTTS(){
+  await fetch('/tts/toggle',{method:'POST'});
+}
+async function syncTTS(){
+  const rate=parseInt(document.getElementById('rate-sl').value);
+  const vol=parseInt(document.getElementById('vol-sl').value)/100;
+  await fetch('/tts/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rate,volume:vol})});
+}
+
+// ── Threshold ─────────────────────────────────────────────────────────────
+async function syncThreshold(){
+  const val=parseInt(document.getElementById('thr-sl').value)/100;
+  await fetch('/threshold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold:val})});
+}
+
+// ── Buffer buttons ────────────────────────────────────────────────────────
+document.getElementById('btn-spc').onclick=()=>pushBuf(' ');
+document.getElementById('btn-bk').onclick=()=>{
+  bufArr.pop();
+  lastAdded=bufArr.length>0?bufArr[bufArr.length-1]:null;
+  renderBuf();
+};
+document.getElementById('btn-cp').onclick=async function(){
+  const t=bufArr.join('');
+  if(t){ await navigator.clipboard.writeText(t); this.textContent='✓ Copied'; setTimeout(()=>this.textContent='Copy',1600); }
+};
+document.getElementById('btn-clr').onclick=async()=>{
+  bufArr=[]; lastAdded=null; renderBuf();
+  await fetch('/buffer/clear',{method:'POST'});
+};
+
+// ── Clear Text (prominent button) ─────────────────────────────────────────
+async function clearText(){
+  bufArr=[]; lastAdded=null; renderBuf();
+  await fetch('/buffer/clear',{method:'POST'});
+}
+document.getElementById('btn-clear-big').onclick = clearText;
+// also wire the existing ✕ header button to the same function
+document.getElementById('btn-clr').onclick = clearText;
+
+// Init
+renderBuf();
+
+// ── Symbol Manager ────────────────────────────────────────────────────
+// Mount panel template into sidebar
+(function(){
+  const tpl = document.getElementById('sym-panel-tpl');
+  const scroll = document.querySelector('.sb-scroll');
+  if(tpl && scroll) scroll.appendChild(tpl.content.cloneNode(true));
+})();
+
+let _collecting = false;
+let _training   = false;
+
+// Load & render all symbol chips
+async function loadSymbols(){
+  try{
+    const r = await fetch('/symbols');
+    const d = await r.json();
+    renderSymGrid(d.classes || []);
+  } catch(e){ /* network not ready */ }
+}
+
+function renderSymGrid(classes){
+  const grid = document.getElementById('sym-grid');
+  if(!grid) return;
+  if(!classes.length){
+    grid.innerHTML = '<span class="sym-empty">No symbols yet</span>';
+    return;
+  }
+  grid.innerHTML = classes.map(c => `
+    <div class="sym-chip" id="sc-${c.name}">
+      <span class="s-name">${c.name}</span>
+      <span class="s-cnt">(${c.samples})</span>
+      <button class="s-del" onclick="deleteSymbol('${c.name}')" title="Delete ${c.name}">✕</button>
+    </div>`).join('');
+}
+
+async function deleteSymbol(name){
+  if(!confirm(`Delete symbol "${name}" and all its samples?`)) return;
+  await fetch('/symbols/delete',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name})
+  });
+  loadSymbols();
+}
+
+async function startCollecting(){
+  const name = (document.getElementById('sym-name').value || '').trim();
+  const n    = parseInt(document.getElementById('sym-n').value) || 60;
+  const repl = document.getElementById('sym-replace').checked;
+  if(!name){ alert('Enter a symbol name first.'); return; }
+  if(!running){ alert('Start Detection first — the camera must be running.'); return; }
+  if(_collecting){ alert('Already collecting.'); return; }
+
+  const r = await fetch('/collect/start',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({class_name:name, n_samples:n, replace:repl})
+  });
+  const d = await r.json();
+  if(!d.ok){ alert(d.error || 'Failed to start collection'); return; }
+
+  _collecting = true;
+  document.getElementById('btn-collect').disabled = true;
+  const prog = document.getElementById('coll-prog');
+  prog.style.display = 'block';
+  document.getElementById('coll-fill').style.width = '0%';
+  document.getElementById('coll-lbl').textContent = `0 / ${n}`;
+  _pollCollect();
+}
+
+function _pollCollect(){
+  if(!_collecting) return;
+  fetch('/collect/status').then(r=>r.json()).then(d=>{
+    if(d.collecting){
+      const pct = d.target > 0 ? Math.round(d.count/d.target*100) : 0;
+      document.getElementById('coll-fill').style.width = pct+'%';
+      document.getElementById('coll-lbl').textContent = `${d.count} / ${d.target}`;
+      setTimeout(_pollCollect, 200);
+    } else {
+      _collectDone();
+    }
+  }).catch(()=>setTimeout(_pollCollect, 500));
+}
+
+function _collectDone(){
+  _collecting = false;
+  document.getElementById('btn-collect').disabled = false;
+  document.getElementById('coll-lbl').textContent = 'Done ✓';
+  setTimeout(()=>{ document.getElementById('coll-prog').style.display='none'; }, 2200);
+  loadSymbols();
+}
+
+function onCollectDone(d){
+  // Called when SSE fires collect_done (backup to polling)
+  if(_collecting) _collectDone();
+  else loadSymbols();
+}
+
+async function startTraining(){
+  if(_training){ alert('Already training.'); return; }
+  const r = await fetch('/train/start',{method:'POST'});
+  const d = await r.json();
+  if(!d.ok){ alert(d.error || 'Failed to start training'); return; }
+  _training = true;
+  document.getElementById('btn-train').disabled = true;
+  document.getElementById('train-prog-wrap').style.display = 'block';
+  document.getElementById('train-fill').style.width = '0%';
+  document.getElementById('train-logs').innerHTML = '';
+  _pollTraining();
+}
+
+function _pollTraining(){
+  fetch('/train/status').then(r=>r.json()).then(d=>{
+    const pct = d.total > 0 ? Math.round(d.progress/d.total*100) : 0;
+    document.getElementById('train-fill').style.width = pct+'%';
+    const logEl = document.getElementById('train-logs');
+    logEl.innerHTML = (d.logs||[]).map((l,i)=>{
+      const cls = l.startsWith('✅') ? 'ok' : '';
+      return `<div class="train-log ${cls}">${l}</div>`;
+    }).join('');
+    logEl.scrollTop = logEl.scrollHeight;
+    if(d.state==='running'){
+      setTimeout(_pollTraining, 600);
+    } else {
+      _training = false;
+      document.getElementById('btn-train').disabled = false;
+      if(d.state==='error'){
+        logEl.innerHTML += `<div class="train-log err">❌ ${d.error}</div>`;
+      }
+      loadSymbols(); // refresh counts
+    }
+  }).catch(()=>setTimeout(_pollTraining,1000));
+}
+
+// Initial load
+loadSymbols();
+</script>
+</body>
+</html>

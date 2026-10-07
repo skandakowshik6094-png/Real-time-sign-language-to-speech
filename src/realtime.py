@@ -2,12 +2,38 @@ import os
 import cv2
 import time
 import torch
+import threading
+import queue
+import pyttsx3
 from utils.setup import get_classes, get_colors
 from utils.logger import get_logger
 from hand_landmarks import HandLandmarkDetector
 from landmark_model import LandmarkClassifier
 
 logger = get_logger("realtime")
+
+# ---------------------------------------------------------------------------
+# Text-to-speech: runs in a background thread so it never stalls the camera
+# ---------------------------------------------------------------------------
+_tts_queue: queue.Queue = queue.Queue()
+
+def _tts_worker():
+    engine = pyttsx3.init()
+    engine.setProperty("rate", 160)   # slightly slower than default for clarity
+    engine.setProperty("volume", 1.0)
+    while True:
+        text = _tts_queue.get()       # blocks until something arrives
+        if text is None:              # sentinel – shut down
+            break
+        engine.say(text)
+        engine.runAndWait()
+
+_tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+_tts_thread.start()
+
+def speak(text: str):
+    """Queue a word / letter for TTS. Non-blocking."""
+    _tts_queue.put(text)
 
 CLASSES = get_classes()
 COLORS = get_colors()
@@ -45,6 +71,11 @@ def run_realtime_detection(camera_id=0):
     frame_count = 0
     fps_start_time = time.time()
 
+    # TTS cooldown state – avoid speaking the same letter on every frame
+    last_spoken: str = ""
+    last_spoken_time: float = 0.0
+    TTS_COOLDOWN = 1.5  # seconds before the same letter can be spoken again
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -61,6 +92,13 @@ def run_realtime_detection(camera_id=0):
                 if confidence > 0.40 and class_idx < len(CLASSES):
                     cls_name = CLASSES[class_idx]
                     color = COLORS[class_idx] if class_idx < len(COLORS) else (0, 255, 0)
+
+                    # Speak the letter if it changed or enough time has elapsed
+                    now = time.time()
+                    if cls_name != last_spoken or (now - last_spoken_time) >= TTS_COOLDOWN:
+                        speak(cls_name)
+                        last_spoken = cls_name
+                        last_spoken_time = now
                 else:
                     cls_name = "Detecting Sign..."
                     color = (200, 200, 200)

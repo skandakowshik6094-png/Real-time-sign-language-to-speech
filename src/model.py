@@ -143,10 +143,27 @@ class DETR(nn.Module):
         self.num_classes = new_num_classes
         self.logger.info(f"Updated model class count from {old_num_classes} to {new_num_classes}")
 
+    def log_model_info(self):
+        """Log model architecture and specifications."""
+        model_config = {
+            "Model Type": "DETR (Detection Transformer)",
+            "Number of Classes": self.num_classes,
+            "Hidden Dimension": 256,
+            "Attention Heads": 8,
+            "Encoder Layers": 1,
+            "Decoder Layers": 1,
+            "Object Queries": self.num_queries,
+            "Backbone": "ResNet-50 (ImageNet pretrained)"
+        }
+        self.model_handler.log_model_architecture(model_config)
+
     def load_pretrained(self, checkpoint_path: str):
         """Load pretrained weights with logging and automatic class count adaptation."""
         try:
-            state_dict = torch.load(checkpoint_path, map_location='cpu')
+            try:
+                state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            except TypeError:
+                state_dict = torch.load(checkpoint_path, map_location='cpu')
             if 'linear_class.weight' in state_dict:
                 checkpoint_num_classes = state_dict['linear_class.weight'].shape[0] - 1
                 if checkpoint_num_classes != self.num_classes:

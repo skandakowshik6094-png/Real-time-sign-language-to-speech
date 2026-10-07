@@ -40,7 +40,7 @@ def get_latest_checkpoint():
             pts_sorted = sorted(pts, key=lambda x: int(x.split("_")[0]) if x.split("_")[0].isdigit() else -1)
             latest = os.path.join(checkpoints_dir, pts_sorted[-1])
             return latest
-    if os.path.exists("pretrained/4426_model.pt"):
+    if os.path.exists("pretrained/4426_model.pt") and os.path.getsize("pretrained/4426_model.pt") > 100000:
         return "pretrained/4426_model.pt"
     return None
 
