@@ -274,7 +274,7 @@ select:focus{border-color:rgba(124,106,247,.5)}
       <div class="cdesc">Minimum confidence to accept a sign</div>
       <div class="srow" style="margin-top:4px">
         <div class="shdr"><span>Threshold</span><span id="thr-lbl">40%</span></div>
-        <input type="range" id="thr-sl" min="10" max="90" value="40" step="5"
+        <input type="range" id="thr-sl" min="5" max="100" value="40" step="1"
                oninput="document.getElementById('thr-lbl').textContent=this.value+'%'" onchange="syncThreshold()">
       </div>
     </div>
@@ -348,6 +348,11 @@ select:focus{border-color:rgba(124,106,247,.5)}
   <!-- Train -->
   <div class="train-wrap">
     <button class="btn-train" id="btn-train" onclick="startTraining()">🧠 Train Model</button>
+    <button class="btn-train" id="btn-retrain-all" onclick="startRetrainAll()"
+      style="margin-top:6px;border-color:rgba(251,146,60,.4);color:rgba(251,146,60,.9);"
+      title="Rebuilds the entire model from scratch using ALL saved samples. Use when detection stops working.">
+      🔄 Fix &amp; Retrain All
+    </button>
     <div id="train-prog-wrap" style="display:none">
       <div class="train-prog-bar"><div class="train-prog-fill" id="train-fill"></div></div>
       <div class="train-logs" id="train-logs"></div>
@@ -363,6 +368,30 @@ select:focus{border-color:rgba(124,106,247,.5)}
 let running=false, autoAdd=true;
 let bufArr=[], lastLtr=null, lastAdded=null;
 let recent=[], evtSrc=null;
+
+// ── Dwell-time state ──────────────────────────────────────────────────────
+// A symbol must be held for DWELL_MS before it's added to the sentence builder.
+// After adding, COOLDOWN_MS must pass before the next addition.
+const DWELL_MS   = 1500;   // hold same symbol for 1.5 s to commit
+const COOLDOWN_MS = 1000;  // 1 s gap between any two additions
+
+let _dwellTimer  = null;   // pending dwell timeout handle
+let _dwellLetter = null;   // symbol currently being held
+let _lastAddTime = 0;      // timestamp of the most recent addition
+
+function _commitLetter(letter) {
+  const now = Date.now();
+  if (now - _lastAddTime < COOLDOWN_MS) return; // still in cooldown
+  pushBuf(letter);
+  lastAdded    = letter;
+  _lastAddTime = now;
+}
+
+function _resetDwell() {
+  clearTimeout(_dwellTimer);
+  _dwellTimer  = null;
+  _dwellLetter = null;
+}
 
 // ── DOM ───────────────────────────────────────────────────────────────────
 const $ltr      = document.getElementById('ltr');
@@ -395,21 +424,50 @@ function addRecent(s){
 // ── Detection handler ─────────────────────────────────────────────────────
 function onDetect(d){
   const {letter:l, confidence:c} = d;
+
+  // ── No hand / below threshold ──────────────────────────────────────────
   if(!l){
     $ltr.textContent='?'; $ltr.classList.remove('on','pop');
     $ring.classList.remove('on');
     $cFill.style.width='0%'; $cPct.textContent='0.0%';
-    $camBadge.classList.remove('show'); return;
+    $camBadge.classList.remove('show');
+    _resetDwell();   // hand left frame — cancel pending dwell
+    lastLtr = null;
+    return;
   }
+
+  // ── Update overlay display (instant, every frame) ─────────────────────
   $ring.classList.add('on');
   $cFill.style.width=c+'%'; $cPct.textContent=c+'%';
-  if(l!==lastLtr){
+
+  if(l !== lastLtr){
     $ltr.classList.remove('on','pop'); void $ltr.offsetWidth;
     $ltr.textContent=l; $ltr.classList.add('on','pop');
     $badgeLtr.textContent=l; $camBadge.classList.add('show');
-    if(autoAdd && l!==lastAdded){ pushBuf(l); lastAdded=l; }
     addRecent(l); lastLtr=l;
   }
+
+  // ── Confidence gate ───────────────────────────────────────────────────
+  const sliderPct = parseInt(document.getElementById('thr-sl').value);
+  if (!autoAdd || c < sliderPct) {
+    _resetDwell();   // doesn't meet threshold — cancel any pending dwell
+    return;
+  }
+
+  // ── Dwell-time gate ───────────────────────────────────────────────────
+  // If this is a DIFFERENT letter from what we're currently timing, restart.
+  if (l !== _dwellLetter) {
+    _resetDwell();
+    _dwellLetter = l;
+    _dwellTimer  = setTimeout(() => {
+      // Dwell complete — commit only if letter hasn't changed and cooldown passed
+      if (_dwellLetter === l) {
+        _commitLetter(l);
+        _resetDwell();
+      }
+    }, DWELL_MS);
+  }
+  // If same letter: timer is already running — do nothing, just let it count down
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────
@@ -470,7 +528,8 @@ async function syncTTS(){
 
 // ── Threshold ─────────────────────────────────────────────────────────────
 async function syncThreshold(){
-  const val=parseInt(document.getElementById('thr-sl').value)/100;
+  const raw = parseInt(document.getElementById('thr-sl').value);
+  const val = Math.min(raw, 99) / 100;   // cap at 0.99 — models never reach 1.0
   await fetch('/threshold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold:val})});
 }
 
@@ -596,6 +655,21 @@ function onCollectDone(d){
   // Called when SSE fires collect_done (backup to polling)
   if(_collecting) _collectDone();
   else loadSymbols();
+}
+
+async function startRetrainAll(){
+  if(_training){ alert('Already training.'); return; }
+  if(!confirm('This will rebuild the model from scratch using ALL saved samples.\nUse this when detection is broken.\n\nProceed?')) return;
+  const r = await fetch('/train/retrain_all',{method:'POST'});
+  const d = await r.json();
+  if(!d.ok){ alert(d.error || 'Failed to start retrain'); return; }
+  _training = true;
+  document.getElementById('btn-train').disabled = true;
+  document.getElementById('btn-retrain-all').disabled = true;
+  document.getElementById('train-prog-wrap').style.display = 'block';
+  document.getElementById('train-fill').style.width = '0%';
+  document.getElementById('train-logs').innerHTML = '';
+  _pollTraining();
 }
 
 async function startTraining(){

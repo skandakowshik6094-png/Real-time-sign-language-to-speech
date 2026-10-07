@@ -58,6 +58,15 @@ class DetectionEngine:
         self.threshold: float = 0.40
         self._hand_detector = None
 
+        # ── Temporal smoothing ────────────────────────────────────────────
+        # Accumulate last SMOOTH_WIN probability vectors; fire only when the
+        # averaged probs exceed threshold and the same class wins consistently.
+        self._SMOOTH_WIN: int = 5         # frames to average
+        self._prob_buf: list  = []        # rolling list of prob vectors
+        self._last_fired: str = ""        # last class that was published
+        self._last_fire_t: float = 0.0    # timestamp of last publish
+        self._COOLDOWN: float = 0.6       # seconds before the same class fires again
+
         # ── Collection state ──────────────────────────────────────────────
         self._collecting: bool = False
         self._collect_class: str = ""
@@ -202,6 +211,12 @@ class DetectionEngine:
             self.running = False
             return
 
+        # ── Camera optimisation ────────────────────────────────────────
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)      # always grab the latest frame
+        cap.set(cv2.CAP_PROP_FPS, 30)            # request 30 FPS from driver
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)  # 640×480 is ideal for landmarks
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
         try:
             while self.running:
                 ret, frame = cap.read()
@@ -249,24 +264,45 @@ class DetectionEngine:
                                 ).start()
                         break  # one hand is sufficient for collection
 
-                    # ── Normal classification ────────────────────────────
+                    # ── Normal classification with temporal smoothing ─────
                     x_tensor = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
-                    class_idx, confidence, _ = self.model.predict_probs(x_tensor)
+                    _, _, probs_list = self.model.predict_probs(x_tensor)
 
-                    if confidence > self.threshold and class_idx < len(self.CLASSES):
+                    # Accumulate prob vectors in rolling buffer
+                    self._prob_buf.append(probs_list)
+                    if len(self._prob_buf) > self._SMOOTH_WIN:
+                        self._prob_buf.pop(0)
+
+                    # Average probabilities across the window
+                    n_cls = len(probs_list)
+                    avg_probs = [0.0] * n_cls
+                    for pv in self._prob_buf:
+                        for k in range(min(n_cls, len(pv))):
+                            avg_probs[k] += pv[k]
+                    avg_probs = [v / len(self._prob_buf) for v in avg_probs]
+
+                    best_idx  = avg_probs.index(max(avg_probs))
+                    confidence = avg_probs[best_idx]
+
+                    if confidence > self.threshold and best_idx < len(self.CLASSES):
                         detected_something = True
-                        cls_name = self.CLASSES[class_idx]
-                        color = tuple(self.COLORS[class_idx]) if class_idx < len(self.COLORS) else (0, 255, 0)
+                        cls_name = self.CLASSES[best_idx]
+                        color = tuple(self.COLORS[best_idx]) if best_idx < len(self.COLORS) else (0, 255, 0)
 
-                        self._speak(cls_name)
-
-                        detection = {
+                        now = time.time()
+                        # Update live display always
+                        self.latest_detection = {"letter": cls_name, "confidence": round(confidence * 100, 1)}
+                        self._publish({
                             "type": "detection",
                             "letter": cls_name,
                             "confidence": round(confidence * 100, 1),
-                        }
-                        self.latest_detection = {"letter": cls_name, "confidence": round(confidence * 100, 1)}
-                        self._publish(detection)
+                        })
+
+                        # Cooldown: only speak / auto-add if sign changed or enough time passed
+                        if cls_name != self._last_fired or (now - self._last_fire_t) > self._COOLDOWN:
+                            self._speak(cls_name)
+                            self._last_fired  = cls_name
+                            self._last_fire_t = now
 
                         wx, wy = pts[0][:2]
                         label = f"{cls_name} ({round(confidence * 100, 1)}%)"
@@ -276,12 +312,14 @@ class DetectionEngine:
                                     cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
                 if not detected_something and not self._collecting:
-                    self._current_letter = ""   # silence TTS when no hand visible
+                    self._prob_buf.clear()          # reset smoothing on hand loss
+                    self._last_fired  = ""
+                    self._current_letter = ""
                     if self.latest_detection.get("letter"):
                         self.latest_detection = {"letter": None, "confidence": 0.0}
                         self._publish({"type": "detection", "letter": None, "confidence": 0.0})
 
-                ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
+                ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
                 if ok:
                     with self._frame_lock:
                         self.latest_frame = jpeg.tobytes()
@@ -390,22 +428,74 @@ class DetectionEngine:
             return 0
 
     def delete_class(self, class_name: str) -> bool:
-        """Remove *class_name* from config.json and all its dataset samples."""
+        """Remove *class_name* from config.json, dataset samples, AND checkpoint.
+
+        The output neuron for the deleted class is removed from the checkpoint
+        so that all remaining neurons keep their correct indices (preventing
+        an index-shift that would make every symbol detected as the wrong one).
+        """
         import json as _json
         config_path = os.path.join(_SRC_DIR, "config.json")
         try:
             with open(config_path) as f:
                 cfg = _json.load(f)
-            if class_name in cfg["classes"]:
-                idx = cfg["classes"].index(class_name)
-                cfg["classes"].pop(idx)
-                if "colors" in cfg and idx < len(cfg["colors"]):
-                    cfg["colors"].pop(idx)
-                with open(config_path, "w") as f:
-                    _json.dump(cfg, f, indent=2)
+
+            if class_name not in cfg["classes"]:
+                self._delete_class_samples(class_name)
+                return True
+
+            del_idx = cfg["classes"].index(class_name)
+            cfg["classes"].pop(del_idx)
+            if "colors" in cfg and del_idx < len(cfg["colors"]):
+                cfg["colors"].pop(del_idx)
+            with open(config_path, "w") as f:
+                _json.dump(cfg, f, indent=2)
+
+            # ── Remove the deleted neuron from the checkpoint ──────────────
+            try:
+                import torch
+                from landmark_model import LandmarkClassifier
+                ckpt_data = torch.load(self.CKPT_PATH, map_location="cpu", weights_only=False)
+                if isinstance(ckpt_data, dict) and "classes" in ckpt_data:
+                    old_classes = ckpt_data["classes"]
+                    if class_name in old_classes:
+                        old_idx = old_classes.index(class_name)
+                        keep    = [i for i in range(len(old_classes)) if i != old_idx]
+                        new_cls = [old_classes[i] for i in keep]
+                        new_n   = len(new_cls)
+
+                        old_m = LandmarkClassifier(num_classes=len(old_classes))
+                        old_m.load_state_dict(ckpt_data["state_dict"])
+                        new_m = LandmarkClassifier(num_classes=new_n)
+
+                        with torch.no_grad():
+                            for layer in ("fc1", "bn1", "fc2", "bn2"):
+                                getattr(new_m, layer).load_state_dict(
+                                    getattr(old_m, layer).state_dict()
+                                )
+                            for new_i, old_i in enumerate(keep):
+                                new_m.fc3.weight.data[new_i] = old_m.fc3.weight.data[old_i].clone()
+                                new_m.fc3.bias.data[new_i]   = old_m.fc3.bias.data[old_i].clone()
+
+                        torch.save(
+                            {"state_dict": new_m.state_dict(), "classes": new_cls, "num_classes": new_n},
+                            self.CKPT_PATH,
+                        )
+                        # Hot-swap the live model
+                        self.model = new_m
+                        self.model.eval()
+                        logger.info(
+                            f"Checkpoint updated: removed neuron for '{class_name}' "
+                            f"(was index {old_idx}), now {new_n} classes"
+                        )
+            except Exception as ckpt_exc:
+                logger.warning(f"Could not update checkpoint after class deletion: {ckpt_exc}")
+
+            # ── Clean up dataset samples ───────────────────────────────────
             self._delete_class_samples(class_name)
+
             self.CLASSES = cfg["classes"]
-            self.COLORS = cfg.get("colors", [])
+            self.COLORS  = cfg.get("colors", [])
             logger.info(f"Deleted class '{class_name}'")
             return True
         except Exception as exc:
