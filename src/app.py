@@ -232,94 +232,138 @@ def train_start():
             from landmark_model import LandmarkClassifier
             from utils.setup import get_classes
 
-            dataset = load_landmark_dataset()
-            samples  = dataset.get("samples", [])
-            classes  = get_classes()
-            num_classes = len(classes)
+            dataset     = load_landmark_dataset()
+            samples     = dataset.get("samples", [])
+            all_classes = get_classes()          # every class known to config
+            num_classes = len(all_classes)
 
-            # ── Collect valid samples & track which classes have data ────────
-            X_data, y_data = [], []
-            classes_with_data: set = set()
-            for item in samples:
-                lbl   = item.get("label")
-                feats = item.get("features", [])
-                if lbl not in classes or len(feats) != 63:
-                    continue
-                c_idx = classes.index(lbl)
-                if c_idx < num_classes:
-                    X_data.append(feats)
-                    y_data.append(c_idx)
-                    classes_with_data.add(lbl)
-
-            if not X_data:
-                with _train_lock:
-                    _train_state["state"] = "error"
-                    _train_state["error"] = "No valid training samples found in the dataset"
-                return
-
-            data_indices = sorted(classes.index(c) for c in classes_with_data)
-
-            with _train_lock:
-                _train_state["logs"].append(
-                    f"New data: {len(X_data)} samples for {sorted(classes_with_data)}"
-                )
-
-            # ── Load existing checkpoint as starting point ───────────────────
-            ckpt_path = "checkpoints/landmark_model.pt"
-            model = LandmarkClassifier(num_classes=num_classes)
+            # ── Identify which classes already live in the checkpoint ────────
+            ckpt_path  = "checkpoints/landmark_model.pt"
+            old_classes: list = []
+            old_state: dict   = {}
 
             if os.path.exists(ckpt_path):
                 try:
                     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
                     if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                        old_cls = ckpt.get("classes", [])
-                        old_n   = len(old_cls)
-                        # Recreate old model and load weights
-                        old_m = LandmarkClassifier(num_classes=old_n)
-                        old_m.load_state_dict(ckpt["state_dict"])
-                        # Transfer backbone and old output neurons
-                        with torch.no_grad():
-                            for layer in ("fc1", "bn1", "fc2", "bn2"):
-                                getattr(model, layer).load_state_dict(
-                                    getattr(old_m, layer).state_dict()
-                                )
-                            n_copy = min(old_n, num_classes)
-                            model.fc3.weight.data[:n_copy] = old_m.fc3.weight.data[:n_copy].clone()
-                            model.fc3.bias.data[:n_copy]   = old_m.fc3.bias.data[:n_copy].clone()
+                        old_classes = ckpt.get("classes", [])
+                        old_state   = ckpt["state_dict"]
+                except Exception as e:
                     with _train_lock:
                         _train_state["logs"].append(
-                            "Loaded existing checkpoint — fine-tuning (old symbols preserved)"
+                            f"⚠️ Could not read checkpoint ({e}) — will train all classes fresh"
+                        )
+
+            # Classes that are NOT yet in the checkpoint  →  need training
+            new_classes = [c for c in all_classes if c not in old_classes]
+
+            if not new_classes:
+                with _train_lock:
+                    _train_state["state"] = "done"
+                    _train_state["logs"].append(
+                        "✅ No new symbols to train — all existing symbols are already in the model. "
+                        "Collect samples for a new symbol first, then train."
+                    )
+                return
+
+            with _train_lock:
+                _train_state["logs"].append(
+                    f"🆕 New symbols to train: {new_classes}  |  "
+                    f"🔒 Preserved (untouched): {old_classes}"
+                )
+
+            # ── Only collect samples that belong to NEW classes ──────────────
+            new_indices = {c: all_classes.index(c) for c in new_classes}
+            X_data, y_data = [], []
+            classes_with_data: set = set()
+
+            for item in samples:
+                lbl   = item.get("label")
+                feats = item.get("features", [])
+                if lbl not in new_classes or len(feats) != 63:
+                    continue          # ← skip ALL old-class samples entirely
+                X_data.append(feats)
+                y_data.append(new_indices[lbl])
+                classes_with_data.add(lbl)
+
+            if not X_data:
+                with _train_lock:
+                    _train_state["state"] = "error"
+                    _train_state["error"] = (
+                        f"No samples found for new symbols {new_classes}. "
+                        "Please collect data for them first."
+                    )
+                return
+
+            missing = [c for c in new_classes if c not in classes_with_data]
+            if missing:
+                with _train_lock:
+                    _train_state["logs"].append(
+                        f"⚠️ No samples collected yet for: {missing} — they will be skipped this run."
+                    )
+
+            trainable_indices = sorted(new_indices[c] for c in classes_with_data)
+
+            with _train_lock:
+                _train_state["logs"].append(
+                    f"📦 Training samples: {len(X_data)} for {sorted(classes_with_data)}"
+                )
+
+            # ── Build model and copy ALL old weights exactly ─────────────────
+            model = LandmarkClassifier(num_classes=num_classes)
+
+            if old_state and old_classes:
+                old_n = len(old_classes)
+                try:
+                    old_m = LandmarkClassifier(num_classes=old_n)
+                    old_m.load_state_dict(old_state)
+                    with torch.no_grad():
+                        # Copy backbone layers verbatim
+                        for layer in ("fc1", "bn1", "fc2", "bn2"):
+                            getattr(model, layer).load_state_dict(
+                                getattr(old_m, layer).state_dict()
+                            )
+                        # Copy ALL old output neurons verbatim (never touched again)
+                        n_copy = min(old_n, num_classes)
+                        model.fc3.weight.data[:n_copy] = old_m.fc3.weight.data[:n_copy].clone()
+                        model.fc3.bias.data[:n_copy]   = old_m.fc3.bias.data[:n_copy].clone()
+                    with _train_lock:
+                        _train_state["logs"].append(
+                            f"🔒 Copied {n_copy} old symbol weights exactly — they will NOT be modified."
                         )
                 except Exception as e:
                     with _train_lock:
-                        _train_state["logs"].append(f"Could not load checkpoint ({e}) — training fresh")
+                        _train_state["logs"].append(f"⚠️ Weight copy failed ({e}) — starting backbone fresh")
 
-            # ── Freeze backbone so old features stay intact ──────────────────
-            for name, param in model.named_parameters():
-                param.requires_grad = ("fc3" in name)
+            # ── Freeze EVERYTHING except fc3 ─────────────────────────────────
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.fc3.parameters():
+                param.requires_grad = True
 
-            # Keep frozen BN layers in eval mode (use stored running stats)
+            # Keep BN layers in eval mode (use stored running stats, not batch)
             model.bn1.eval()
             model.bn2.eval()
 
-            # ── Gradient mask: only update fc3 rows for classes WITH data ────
+            # ── Gradient mask: ONLY update rows for NEW classes with data ─────
+            # Old class rows (indices 0..len(old_classes)-1) are NEVER touched.
             def _mask_weight(grad):
                 m = torch.zeros_like(grad)
-                for i in data_indices:
+                for i in trainable_indices:
                     m[i] = 1.0
                 return grad * m
 
             def _mask_bias(grad):
                 m = torch.zeros_like(grad)
-                for i in data_indices:
+                for i in trainable_indices:
                     m[i] = 1.0
                 return grad * m
 
             model.fc3.weight.register_hook(_mask_weight)
             model.fc3.bias.register_hook(_mask_bias)
 
-            # ── Training loop ────────────────────────────────────────────────
-            EPOCHS = 60   # more epochs since only the output layer is trained
+            # ── Training loop ─────────────────────────────────────────────────
+            EPOCHS = 60
             with _train_lock:
                 _train_state["total"] = EPOCHS
 
@@ -331,12 +375,12 @@ def train_start():
             tr_ld = DataLoader(train_ds, batch_size=16, shuffle=True,  drop_last=False)
             va_ld = DataLoader(val_ds,   batch_size=16, drop_last=False)
 
-            trainable = [p for p in model.parameters() if p.requires_grad]
-            opt  = optim.Adam(trainable, lr=1e-3, weight_decay=1e-4)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            opt  = optim.Adam(trainable_params, lr=1e-3, weight_decay=1e-4)
             crit = nn.CrossEntropyLoss()
 
             for epoch in range(1, EPOCHS + 1):
-                model.fc3.train()   # only fc3 needs train mode
+                model.fc3.train()
                 ep_loss = 0.0
                 for Xb, yb in tr_ld:
                     opt.zero_grad()
@@ -362,19 +406,19 @@ def train_start():
                             f"Epoch {epoch}/{EPOCHS} — Loss {ep_loss/len(tr_ld):.4f} | Val {acc*100:.1f}%"
                         )
 
-            # ── Save & hot-reload ────────────────────────────────────────────
+            # ── Save & hot-reload ─────────────────────────────────────────────
             torch.save({"state_dict": model.state_dict(),
-                        "classes": classes, "num_classes": num_classes}, ckpt_path)
+                        "classes": all_classes,
+                        "num_classes": num_classes}, ckpt_path)
             engine._load_model()
             engine.model.eval()
-            engine.CLASSES = classes
+            engine.CLASSES = all_classes
 
             with _train_lock:
                 _train_state["state"] = "done"
                 _train_state["logs"].append(
-                    f"✅ Saved & reloaded — {num_classes} classes "
-                    f"({len(classes_with_data)} updated, "
-                    f"{num_classes - len(classes_with_data)} preserved from old model)"
+                    f"✅ Done — {len(classes_with_data)} new symbol(s) added: {sorted(classes_with_data)}  |  "
+                    f"🔒 {len(old_classes)} old symbol(s) untouched: {old_classes}"
                 )
 
         except Exception as exc:
