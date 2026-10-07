@@ -29,7 +29,10 @@ HAND_CONNECTIONS = [
 
 FINGER_TIP_NAMES = {4:"Thumb", 8:"Index", 12:"Middle", 16:"Ring", 20:"Pinky"}
 
-MODEL_PATH = "pretrained/hand_landmarker.task"
+# Resolve pretrained dir relative to the project root (parent of src/)
+_SRC_DIR   = os.path.dirname(os.path.abspath(__file__))
+_PROJ_ROOT = os.path.dirname(_SRC_DIR)
+MODEL_PATH = os.path.join(_PROJ_ROOT, "pretrained", "hand_landmarker.task")
 
 # ── EMA smoothing factor (0 = no smoothing, 1 = frozen) ───────────────────
 _EMA_ALPHA = 0.55   # higher = snappier, lower = smoother
@@ -43,7 +46,8 @@ _TIP_COLOR   = (0, 255, 180)   # label text
 
 def ensure_model_file():
     """Download official MediaPipe HandLandmarker model file if not present."""
-    os.makedirs("pretrained", exist_ok=True)
+    pretrained_dir = os.path.dirname(MODEL_PATH)
+    os.makedirs(pretrained_dir, exist_ok=True)
     if not os.path.exists(MODEL_PATH):
         url = ("https://storage.googleapis.com/mediapipe-models/"
                "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")

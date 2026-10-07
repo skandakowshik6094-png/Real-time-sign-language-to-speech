@@ -1,0 +1,50 @@
+# render.yaml — Render Web Service configuration for SignSense
+# Docs: https://render.com/docs/yaml-spec
+
+services:
+  - type: web
+    name: signsense
+    runtime: python
+    region: oregon          # closest region to your users (change as needed)
+    plan: free              # upgrade to 'starter' for more RAM for PyTorch
+
+    # Render uses the repo root as the build root
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      python -c "
+      import urllib.request, os
+      os.makedirs('pretrained', exist_ok=True)
+      model = 'pretrained/hand_landmarker.task'
+      if not os.path.exists(model):
+          urllib.request.urlretrieve(
+              'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+              model
+          )
+      print('MediaPipe model ready:', model)
+      "
+
+    # Gunicorn with 1 worker (free tier RAM limit) and long timeout for SSE
+    startCommand: >
+      gunicorn
+      --bind 0.0.0.0:$PORT
+      --workers 1
+      --threads 4
+      --timeout 120
+      --worker-class gthread
+      --chdir src
+      app:app
+
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+
+    # Persist the checkpoint and dataset across deploys
+    # (Render Disks are paid; if you're on the free tier, omit this block
+    #  and upload a pre-trained checkpoint at build time instead.)
+    # disk:
+    #   name: signsense-data
+    #   mountPath: /opt/render/project/src
+    #   sizeGB: 1

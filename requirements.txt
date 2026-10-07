@@ -1,0 +1,13 @@
+# SignSense — pip requirements for Render deployment
+# NOTE: opencv-python-headless is used (no display/GUI needed on the server).
+#       pyttsx3 is NOT installed on Linux — the browser uses Web Speech API instead.
+
+flask>=3.0.0
+gunicorn>=21.0.0
+mediapipe>=1.0.1
+numpy>=2.0.0
+opencv-python-headless>=4.9.0.80
+torch>=2.0.0
+torchvision>=0.15.0
+colorama>=0.4.6
+rich>=13.0.0

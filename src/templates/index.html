@@ -189,7 +189,12 @@ select:focus{border-color:rgba(124,106,247,.5)}
       <p>Camera is off</p>
       <span>Press <strong style="color:#7c6af7">Start Detection</strong> to begin</span>
     </div>
-    <img id="cam-feed" src="" alt="Live sign language camera feed">
+    <!-- Hidden video element feeds into the canvas -->
+    <video id="localVideo" autoplay playsinline muted style="display:none"></video>
+    <!-- Main display canvas (shows user's camera) -->
+    <canvas id="cam-feed" style="width:100%;height:100%;object-fit:cover;display:none"></canvas>
+    <!-- Landmark overlay canvas (drawn on top) -->
+    <canvas id="lm-overlay" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;display:none"></canvas>
     <div class="cam-badge" id="cam-badge">
       <div class="cam-badge-dot"></div>
       <span id="badge-ltr">—</span>
@@ -393,6 +398,37 @@ function _resetDwell() {
   _dwellLetter = null;
 }
 
+// ── Browser-side TTS (Web Speech API) ─────────────────────────────────────
+// Used when running on Linux/Render where pyttsx3 is unavailable.
+let _browserTTS = false;       // set to true if server has no server-side TTS
+let _ttsBusy    = false;
+let _lastSpoken = '';
+let _lastSpeakT = 0;
+
+(async function initTTS(){
+  try {
+    const r = await fetch('/tts/capable');
+    const d = await r.json();
+    _browserTTS = !d.server_tts;  // use browser TTS when server cannot speak
+  } catch(e) {
+    _browserTTS = true; // fallback: assume browser TTS needed
+  }
+})();
+
+function _browserSpeak(text) {
+  if (!_browserTTS || !window.speechSynthesis) return;
+  // Debounce: don't repeat the same word within 1.5s
+  const now = Date.now();
+  if (text === _lastSpoken && now - _lastSpeakT < 1500) return;
+  _lastSpoken = text;
+  _lastSpeakT = now;
+  window.speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate   = 1.0;
+  utt.volume = 1.0;
+  window.speechSynthesis.speak(utt);
+}
+
 // ── DOM ───────────────────────────────────────────────────────────────────
 const $ltr      = document.getElementById('ltr');
 const $ring     = document.getElementById('ltr-ring');
@@ -403,7 +439,6 @@ const $chips    = document.getElementById('chips');
 const $btnTog   = document.getElementById('btn-tog');
 const $stPill   = document.getElementById('st-pill');
 const $stLbl    = document.getElementById('st-lbl');
-const $camFeed  = document.getElementById('cam-feed');
 const $camIdle  = document.getElementById('cam-idle');
 const $camWrap  = document.getElementById('cam-wrap');
 const $camBadge = document.getElementById('cam-badge');
@@ -478,43 +513,114 @@ function connectSSE(){
     const d=JSON.parse(e.data);
     if(d.type==='detection') onDetect(d);
     if(d.type==='collect_done') onCollectDone(d);
+    if(d.type==='tts_speak') _browserSpeak(d.text);  // browser TTS for Render/Linux
   };
   evtSrc.onerror = ()=>{ if(running) setTimeout(connectSSE,1200); };
 }
 
 // ── Start / Stop ──────────────────────────────────────────────────────────
+const $localVideo = document.getElementById('localVideo');
+const $canvas     = document.getElementById('cam-feed');
+const $overlay    = document.getElementById('lm-overlay');
+let   _stream     = null;
+let   _inferLoop  = null;
+let   _inferBusy  = false;
+
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]
+];
+
+function _drawLandmarks(landmarks, fw, fh){
+  const ctx = $overlay.getContext('2d');
+  const sx = $overlay.width/fw, sy = $overlay.height/fh;
+  ctx.clearRect(0,0,$overlay.width,$overlay.height);
+  landmarks.forEach(pts=>{
+    ctx.strokeStyle='rgba(124,106,247,0.85)'; ctx.lineWidth=2;
+    HAND_CONNECTIONS.forEach(([a,b])=>{
+      if(!pts[a]||!pts[b]) return;
+      ctx.beginPath(); ctx.moveTo(pts[a][0]*sx,pts[a][1]*sy);
+      ctx.lineTo(pts[b][0]*sx,pts[b][1]*sy); ctx.stroke();
+    });
+    pts.forEach(([x,y],i)=>{
+      ctx.beginPath(); ctx.arc(x*sx,y*sy,i===0?5:3,0,Math.PI*2);
+      ctx.fillStyle=i===0?'#22d3ee':'#fff'; ctx.fill();
+    });
+  });
+}
+
+async function _sendFrame(){
+  if(!running||_inferBusy) return;
+  _inferBusy=true;
+  try{
+    const ctx=$canvas.getContext('2d');
+    $canvas.width=$localVideo.videoWidth||640;
+    $canvas.height=$localVideo.videoHeight||480;
+    $overlay.width=$canvas.width; $overlay.height=$canvas.height;
+    ctx.drawImage($localVideo,0,0,$canvas.width,$canvas.height);
+    const frame=$canvas.toDataURL('image/jpeg',0.7);
+    const resp=await fetch('/infer',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({frame})});
+    const d=await resp.json();
+    if(d.landmarks&&d.landmarks.length) _drawLandmarks(d.landmarks,d.frame_w,d.frame_h);
+    else $overlay.getContext('2d').clearRect(0,0,$overlay.width,$overlay.height);
+    onDetect({letter:d.label,confidence:d.confidence||0});
+    if(d.is_collecting){
+      const pct=d.collect_target>0?Math.round(d.collect_count/d.collect_target*100):0;
+      const fi=document.getElementById('coll-fill');
+      const li=document.getElementById('coll-lbl');
+      if(fi) fi.style.width=pct+'%';
+      if(li) li.textContent=`${d.collect_count} / ${d.collect_target}`;
+      if(d.collect_count>=d.collect_target&&_collecting) _collectDone();
+    }
+  }catch(e){}
+  _inferBusy=false;
+}
+function _inferTick(){ _sendFrame(); if(running) _inferLoop=setTimeout(_inferTick,100); }
+
 async function toggleDetection(){
   running ? await stopDetection() : await startDetection();
 }
 
 async function startDetection(){
-  const cam = parseInt(document.getElementById('cam-sel').value);
-  const r = await fetch('/control/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({camera_id:cam})});
-  if(!r.ok) return;
+  try{
+    _stream=await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+  }catch(e){
+    alert('Camera access denied. Please allow camera access in your browser.'); return;
+  }
+  $localVideo.srcObject=_stream;
+  await new Promise(r=>$localVideo.onloadedmetadata=r);
+  await fetch('/control/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   running=true;
   $btnTog.innerHTML=`<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Stop Detection`;
   $btnTog.className='btn-main stop';
   $stPill.classList.add('live'); $stLbl.textContent='Live';
-  $camFeed.src='/video_feed?t='+Date.now();
-  $camFeed.style.display='block'; $camIdle.style.display='none';
-  $camWrap.classList.add('live');
+  $canvas.style.display='block'; $overlay.style.display='block';
+  $camIdle.style.display='none'; $camWrap.classList.add('live');
   connectSSE();
+  _inferLoop=setTimeout(_inferTick,100);
 }
 
 async function stopDetection(){
+  clearTimeout(_inferLoop); _inferLoop=null;
+  if(_stream){_stream.getTracks().forEach(t=>t.stop());_stream=null;}
   await fetch('/control/stop',{method:'POST'});
   running=false;
   $btnTog.innerHTML=`<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Start Detection`;
   $btnTog.className='btn-main go';
   $stPill.classList.remove('live'); $stLbl.textContent='Idle';
-  $camFeed.src=''; $camFeed.style.display='none';
+  $canvas.style.display='none'; $overlay.style.display='none';
+  $overlay.getContext('2d').clearRect(0,0,$overlay.width,$overlay.height);
   $camIdle.style.display='flex'; $camWrap.classList.remove('live');
   $ltr.textContent='?'; $ltr.classList.remove('on','pop');
   $ring.classList.remove('on');
   $cFill.style.width='0%'; $cPct.textContent='0.0%';
   $camBadge.classList.remove('show'); lastLtr=null;
-  if(evtSrc){ evtSrc.close(); evtSrc=null; }
+  if(evtSrc){evtSrc.close();evtSrc=null;}
 }
+
+
 
 // ── TTS ───────────────────────────────────────────────────────────────────
 async function toggleTTS(){

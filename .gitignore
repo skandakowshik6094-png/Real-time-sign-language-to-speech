@@ -19,13 +19,14 @@ node_modules/
 # ── ML artefacts (large — ship separately or via LFS) ─
 checkpoints/*.pt
 pretrained/
-data/landmarks/
 data/user/
 data/autsl/
 *.task
 
 # Keep checkpoint directory stub
 !checkpoints/.gitkeep
+# Allow the small landmark classifier (~86 KB) — needed for Render deploy
+!checkpoints/landmark_model.pt
 
 # ── Logs ──────────────────────────────────────────────
 logs/
@@ -34,7 +35,9 @@ src/logs/
 
 # ── Training dataset (may be large; exclude raw data) ─
 src/data/
-data/
+# Allow landmark JSON dataset (~3 MB) — needed for re-training on Render
+!data/landmarks/
+!data/landmarks/landmark_dataset.json
 
 # ── OS / IDE ──────────────────────────────────────────
 .DS_Store

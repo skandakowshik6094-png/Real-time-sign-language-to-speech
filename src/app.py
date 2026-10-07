@@ -1,13 +1,18 @@
 """
 app.py -- Flask web server for SignSense.
 
+ARCHITECTURE: Browser-camera model (camera-secure)
+  The user's browser captures from THEIR OWN camera via getUserMedia().
+  Frames are posted to /infer; only the prediction (JSON) is returned.
+  The server NEVER accesses any camera device.
+
 Endpoints:
   GET  /                   -- Dashboard HTML
-  GET  /video_feed         -- MJPEG camera stream
-  GET  /events             -- Server-Sent Events (detection results)
+  POST /infer              -- {frame: base64 JPEG} -> {label, confidence, landmarks}
+  GET  /events             -- Server-Sent Events (detection + collect results)
   GET  /status             -- JSON status snapshot
-  POST /control/start      -- Start detection  {camera_id: int}
-  POST /control/stop       -- Stop detection
+  POST /control/start      -- Mark detection active (no server camera opened)
+  POST /control/stop       -- Mark detection inactive
   POST /tts/toggle         -- Toggle TTS on/off
   POST /tts/settings       -- {rate: int, volume: float 0-1}
   POST /threshold          -- {threshold: float 0-1}
@@ -28,6 +33,25 @@ if _SRC_DIR not in sys.path:
 from flask import Flask, Response, render_template, jsonify, request, stream_with_context
 
 from detection_engine import DetectionEngine
+
+# ── Startup: ensure required directories exist ──────────────────────────────
+_PROJECT_ROOT = os.path.dirname(_SRC_DIR)
+os.makedirs(os.path.join(_PROJECT_ROOT, "checkpoints"), exist_ok=True)
+os.makedirs(os.path.join(_PROJECT_ROOT, "pretrained"), exist_ok=True)
+os.makedirs(os.path.join(_PROJECT_ROOT, "data", "landmarks"), exist_ok=True)
+
+# ── Auto-download MediaPipe model if missing (happens on first Render deploy) ─
+_MP_MODEL = os.path.join(_PROJECT_ROOT, "pretrained", "hand_landmarker.task")
+if not os.path.exists(_MP_MODEL):
+    import urllib.request
+    _MP_URL = ("https://storage.googleapis.com/mediapipe-models/"
+               "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
+    try:
+        print(f"  Downloading MediaPipe model to {_MP_MODEL} ...")
+        urllib.request.urlretrieve(_MP_URL, _MP_MODEL)
+        print("  MediaPipe model downloaded.")
+    except Exception as _e:
+        print(f"  Warning: could not download MediaPipe model: {_e}")
 
 app = Flask(__name__, template_folder=os.path.join(_SRC_DIR, "templates"))
 engine = DetectionEngine()
@@ -51,25 +75,27 @@ def index():
 # Streams
 # ---------------------------------------------------------------------------
 
-@app.route("/video_feed")
-def video_feed():
-    """MJPEG stream of annotated camera frames."""
-    def generate():
-        while True:
-            with engine._frame_lock:
-                frame = engine.latest_frame
-            if frame:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-                )
-            time.sleep(0.03)          # ~33 fps cap
+@app.route("/infer", methods=["POST"])
+def infer():
+    """Receive one JPEG frame from the user's browser camera and return prediction.
 
-    return Response(
-        stream_with_context(generate()),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-cache"},
-    )
+    The server NEVER opens a camera device — all video stays on the user's machine.
+    Only the hand-landmark features and the predicted sign label are returned.
+    """
+    import base64
+    data = request.get_json(force=True, silent=True) or {}
+    img_b64 = data.get("frame", "")
+    if not img_b64:
+        return jsonify({"error": "No frame provided"}), 400
+    # Strip data-URL prefix if present (e.g. "data:image/jpeg;base64,...")
+    if "," in img_b64:
+        img_b64 = img_b64.split(",", 1)[1]
+    try:
+        frame_bytes = base64.b64decode(img_b64)
+    except Exception:
+        return jsonify({"error": "Invalid base64"}), 400
+    result = engine.process_frame(frame_bytes)
+    return jsonify(result)
 
 
 @app.route("/events")
@@ -103,15 +129,20 @@ def events():
 
 @app.route("/control/start", methods=["POST"])
 def start():
-    data = request.get_json(silent=True) or {}
-    engine.start(camera_id=int(data.get("camera_id", 0)))
-    return jsonify({"ok": True, "running": engine.running})
+    """Mark detection as active. Browser camera is used — no server camera opened."""
+    engine.running = True
+    return jsonify({"ok": True, "running": True})
 
 
 @app.route("/control/stop", methods=["POST"])
 def stop():
-    engine.stop()
-    return jsonify({"ok": True, "running": engine.running})
+    """Mark detection as inactive. Resets smoothing buffers."""
+    engine.running = False
+    engine._prob_buf.clear()
+    engine._last_fired = ""
+    engine._current_letter = ""
+    engine.latest_detection = {"letter": None, "confidence": 0.0}
+    return jsonify({"ok": True, "running": False})
 
 
 @app.route("/status")
@@ -149,10 +180,18 @@ def set_threshold():
     engine.threshold = max(0.05, min(0.99, float(data.get("threshold", engine.threshold))))
     return jsonify({"ok": True, "threshold": engine.threshold})
 
+# ---------------------------------------------------------------------------
+# TTS capability query
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Buffer (server resets TTS cooldown; actual buffer lives in the browser)
-# ---------------------------------------------------------------------------
+@app.route("/tts/capable")
+def tts_capable():
+    """Return whether server-side TTS (pyttsx3) is available.
+    On Linux/Render the browser should use Web Speech API instead."""
+    import sys
+    return jsonify({"server_tts": sys.platform == "win32"})
+
+
 
 @app.route("/buffer/clear", methods=["POST"])
 def clear_buffer():
@@ -389,7 +428,7 @@ def train_retrain_all():
                 model.load_state_dict(best_state)
 
             model.eval()
-            ckpt_path = "checkpoints/landmark_model.pt"
+            ckpt_path = engine.CKPT_PATH
             torch.save({"state_dict": model.state_dict(),
                         "classes": all_classes,
                         "num_classes": num_classes}, ckpt_path)
@@ -440,7 +479,7 @@ def train_start():
             num_classes = len(all_classes)
 
             # Identify which classes are already in the checkpoint
-            ckpt_path   = "checkpoints/landmark_model.pt"
+            ckpt_path   = engine.CKPT_PATH
             old_classes = []
             old_state   = {}
 

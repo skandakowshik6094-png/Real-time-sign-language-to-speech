@@ -14,17 +14,21 @@ from utils.logger import get_logger
 from interactive_collector import add_class_to_config
 
 logger = get_logger("landmark_trainer")
-DATASET_PATH = "data/landmarks/landmark_dataset.json"
+# Resolve paths relative to the project root (parent of src/)
+_SRC_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PROJ_ROOT  = os.path.dirname(_SRC_DIR)
+DATASET_PATH = os.path.join(_PROJ_ROOT, "data", "landmarks", "landmark_dataset.json")
+_CKPT_PATH   = os.path.join(_PROJ_ROOT, "checkpoints", "landmark_model.pt")
 
 def load_landmark_dataset():
-    os.makedirs("data/landmarks", exist_ok=True)
+    os.makedirs(os.path.dirname(DATASET_PATH), exist_ok=True)
     if os.path.exists(DATASET_PATH):
         with open(DATASET_PATH, "r") as f:
             return json.load(f)
     return {"samples": []}
 
 def save_landmark_dataset(data):
-    os.makedirs("data/landmarks", exist_ok=True)
+    os.makedirs(os.path.dirname(DATASET_PATH), exist_ok=True)
     with open(DATASET_PATH, "w") as f:
         json.dump(data, f)
 
@@ -191,16 +195,15 @@ def train_landmark_classifier(epochs=40, batch_size=16, lr=1e-3):
             val_acc = correct / max(1, total)
             logger.info(f"Epoch {epoch}/{epochs} | Loss: {round(total_loss/len(train_loader), 4)} | Val Accuracy: {round(val_acc*100, 2)}%")
 
-    os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = "checkpoints/landmark_model.pt"
+    os.makedirs(os.path.dirname(_CKPT_PATH), exist_ok=True)
     torch.save({
         "state_dict": model.state_dict(),
         "classes": classes,
         "num_classes": num_classes
-    }, ckpt_path)
+    }, _CKPT_PATH)
 
-    logger.success(f"Landmark Neural Model trained successfully! Saved to '{ckpt_path}'")
-    return ckpt_path
+    logger.success(f"Landmark Neural Model trained successfully! Saved to '{_CKPT_PATH}'")
+    return _CKPT_PATH
 
 if __name__ == "__main__":
     train_landmark_classifier(epochs=30)

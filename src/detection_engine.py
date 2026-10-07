@@ -30,7 +30,9 @@ class DetectionEngine:
         self.COLORS: list = get_colors()
 
         self.model = LandmarkClassifier(num_classes=len(self.CLASSES))
-        self.CKPT_PATH = "checkpoints/landmark_model.pt"
+        # Resolve checkpoint path relative to the project root (one level above src/)
+        _project_root = os.path.dirname(_SRC_DIR)
+        self.CKPT_PATH = os.path.join(_project_root, "checkpoints", "landmark_model.pt")
         self._load_model()
         self.model.eval()
 
@@ -92,14 +94,27 @@ class DetectionEngine:
         except Exception as exc:
             logger.warning(f"Could not load checkpoint: {exc}")
 
-    def _tts_worker(self) -> None:
-        """Speak _current_letter by spawning an isolated Python subprocess.
+    @property
+    def _tts_server_side(self) -> bool:
+        """True only on Windows where pyttsx3 works reliably.
+        On Linux (Render, Docker) we emit SSE events and let the browser speak."""
+        return sys.platform == "win32"
 
-        Using a subprocess sidesteps COM threading conflicts between pyttsx3
-        and the Flask/OpenCV/MediaPipe threads that plague in-process TTS.
-        Any in-flight utterance is killed before the new one starts so the
-        voice always says the *current* letter.
+    def _tts_worker(self) -> None:
+        """Speak _current_letter.
+
+        On Windows: spawns an isolated pyttsx3 subprocess (sidesteps COM threading).
+        On Linux/Render: no-op — _speak() already published a tts_speak SSE event
+                         so the browser's Web Speech API handles audio output.
         """
+        if not self._tts_server_side:
+            # Nothing to do on headless Linux; just keep the thread alive so
+            # other code that sets _tts_event doesn't block.
+            while True:
+                self._tts_event.wait(timeout=30)
+                self._tts_event.clear()
+            return
+
         INTERVAL = 0.5          # max seconds between utterances
         proc = None
 
@@ -130,8 +145,7 @@ class DetectionEngine:
                     f'e.say("{text}"); e.runAndWait()'
                 )
                 kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-                if sys.platform == "win32":
-                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                 proc = subprocess.Popen([sys.executable, "-c", script], **kwargs)
             except Exception as exc:
                 logger.warning(f"TTS subprocess error: {exc}")
@@ -141,10 +155,19 @@ class DetectionEngine:
         raise NotImplementedError("TTS now runs via subprocess")
 
     def _speak(self, text: str) -> None:
-        """Signal the TTS worker to say *text* on its next cycle."""
-        if self.tts_enabled:
-            self._current_letter = text
-            self._tts_event.set()
+        """Signal the TTS worker to say *text*.
+
+        On Windows: the subprocess worker picks it up.
+        On Linux/Render: publish a tts_speak SSE event — the browser's
+        Web Speech API will synthesise the audio on the user's device.
+        """
+        if not self.tts_enabled:
+            return
+        self._current_letter = text
+        self._tts_event.set()
+        # Always emit the SSE event so the browser can speak even on Windows
+        # (the browser will deduplicate using its own cooldown).
+        self._publish({"type": "tts_speak", "text": text})
 
     def subscribe(self):
         q: queue.Queue = queue.Queue(maxsize=64)
@@ -327,6 +350,114 @@ class DetectionEngine:
         finally:
             cap.release()
             self.running = False
+
+    # ── Browser-frame inference (replaces server camera stream) ──────────
+    def process_frame(self, frame_bytes: bytes) -> dict:
+        """Process a single JPEG frame uploaded from the user's browser.
+
+        Returns a dict with:
+          label, confidence, landmarks (list of [[x,y] px per hand]),
+          frame_w, frame_h, is_collecting, collect_count, collect_target
+        """
+        import numpy as np
+        nparr = np.frombuffer(frame_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return {"error": "Invalid frame"}
+
+        h, w = frame.shape[:2]
+
+        if self._hand_detector is None:
+            self._hand_detector = HandLandmarkDetector(show_coordinates=True)
+
+        _frame, hand_pts_list, feature_vectors = self._hand_detector.process_and_draw(frame)
+
+        result: dict = {
+            "label": None, "confidence": 0.0,
+            "landmarks": [],   # [[[x,y], ...21 pts] per hand] — pixel coords
+            "frame_w": w, "frame_h": h,
+            "is_collecting": self._collecting,
+            "collect_count": self._collect_count,
+            "collect_target": self._collect_target,
+            "collect_class": self._collect_class,
+        }
+
+        detected_something = False
+        for pts, feats in zip(hand_pts_list, feature_vectors):
+            if len(feats) != 63:
+                continue
+
+            # Store landmark pixel coords for browser drawing
+            result["landmarks"].append([[int(p[0]), int(p[1])] for p in pts])
+
+            # ── Collection mode ───────────────────────────────────────────
+            if self._collecting:
+                if self._collect_count < self._collect_target:
+                    self._collect_buffer.append(feats)
+                    self._collect_count += 1
+                    self._publish({
+                        "type": "collect_progress",
+                        "count": self._collect_count,
+                        "target": self._collect_target,
+                        "class_name": self._collect_class,
+                    })
+                    result["is_collecting"] = True
+                    result["collect_count"] = self._collect_count
+                    if self._collect_count >= self._collect_target:
+                        self._collecting = False
+                        threading.Thread(
+                            target=self._finalize_collection,
+                            daemon=True, name="CollectFinalize",
+                        ).start()
+                break  # one hand sufficient for collection
+
+            # ── Classification with temporal smoothing ────────────────────
+            x_tensor = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
+            _, _, probs_list = self.model.predict_probs(x_tensor)
+
+            self._prob_buf.append(probs_list)
+            if len(self._prob_buf) > self._SMOOTH_WIN:
+                self._prob_buf.pop(0)
+
+            n_cls = len(probs_list)
+            avg_probs = [0.0] * n_cls
+            for pv in self._prob_buf:
+                for k in range(min(n_cls, len(pv))):
+                    avg_probs[k] += pv[k]
+            avg_probs = [v / len(self._prob_buf) for v in avg_probs]
+
+            best_idx   = avg_probs.index(max(avg_probs))
+            confidence = avg_probs[best_idx]
+
+            if confidence > self.threshold and best_idx < len(self.CLASSES):
+                detected_something = True
+                cls_name = self.CLASSES[best_idx]
+                now = time.time()
+                self.latest_detection = {
+                    "letter": cls_name,
+                    "confidence": round(confidence * 100, 1),
+                }
+                self._publish({
+                    "type": "detection",
+                    "letter": cls_name,
+                    "confidence": round(confidence * 100, 1),
+                })
+                if cls_name != self._last_fired or (now - self._last_fire_t) > self._COOLDOWN:
+                    self._speak(cls_name)
+                    self._last_fired  = cls_name
+                    self._last_fire_t = now
+                result["label"]      = cls_name
+                result["confidence"] = round(confidence * 100, 1)
+
+        if not detected_something and not self._collecting:
+            self._prob_buf.clear()
+            self._last_fired     = ""
+            self._current_letter = ""
+            if self.latest_detection.get("letter"):
+                self.latest_detection = {"letter": None, "confidence": 0.0}
+                self._publish({"type": "detection", "letter": None, "confidence": 0.0})
+
+        return result
 
     # ── Collection API ────────────────────────────────────────────────────
 
